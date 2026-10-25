@@ -4,18 +4,77 @@ Two things live here, and they are deliberately separate:
 
 | | what it does | run it |
 |---|---|---|
-| **music sync** (`sync.py`) | plans and copies the library onto the Walkman's two volumes, writes the playlists, removes what no longer belongs, uploads `.scrobbler.log` to Last.fm | `python sync.py` |
+| **music sync** (`sync.py`) | plans and copies the library onto the Walkman's two volumes, writes the playlists, removes what no longer belongs, uploads `.scrobbler.log` to Last.fm | `python sync.py` or the **Walkman Sync** shortcut |
 | **likes sync** (`likesync/`) | keeps *liked* in step across the Walkman, Last.fm and MusicBee, and writes a **Liked Songs** playlist onto the device | `python -m likesync sync` |
 
 `app.py` is the full-screen front-end both of them share; `tui.py` is the terminal toolkit it is
 built from. Everything is standard library only — no pip install, no venv, any Python 3.10+.
 
 ```
-python sync.py              # full-screen UI (music sync, likes, scrobbles, settings)
-python sync.py --classic    # the original scrolling menu, unchanged
-python -m likesync status   # likes only, no UI, read-only
-python -m unittest discover -s tests
+python3 launch.py --install-shortcut  # Windows: Desktop + Start Menu
+                                      # macOS: Desktop .command + ~/Applications .app
+python3 launch.py                     # own window if double-clicked; in-place in a terminal
+python3 sync.py                       # full-screen UI in the current terminal
+python3 sync.py --classic             # the original scrolling menu, unchanged
+python3 -m likesync status            # likes only, no UI, read-only
+python3 -m unittest discover -s tests
 ```
+
+Python 3.10+ on PATH (no venv, no pip). After `--install-shortcut`:
+
+* **Windows** — pin **Walkman Sync** from the Start Menu or the desktop. The shortcut uses
+  `assets/walkman-sync.ico`. Double-click `launch.pyw` for the same dedicated window without a
+  bootstrap console flash. Windows Terminal is used when it is installed; otherwise a plain console.
+* **macOS** — double-click **Walkman Sync** on the Desktop (Terminal.app), or drag
+  `~/Applications/Walkman Sync.app` to the Dock. Both pick up `assets/walkman-sync.png`. Cinder
+  mounts as `/Volumes/WALKMAN`; an Android card in a USB reader is `/Volumes/<label>/Music`. A
+  Windows UNC library path (`\\server\share`) is tried as `/Volumes/<share>` when the UNC is missing.
+
+`python3 sync.py` is unchanged for running inside a terminal you already have. MusicBee likes stay
+Windows-only.
+
+---
+
+## Android Walkmans (ZX500 / A100, WM1AM2, A300 / ZX700)
+
+Stock W. Music on these players is a different USB world from a Cinder A50. Settings ▸ **Device**
+is `cinder` (default) or `android-walkman`.
+
+On `android-walkman`:
+
+* music and relative `.m3u8` playlists go in **`Music/`** (Sony's default folder — do not rename it);
+* DSD/AIFF (`.dsf` / `.dff` / `.aiff`) copy with the rest of the library;
+* `Liked Songs.m3u8` is written; Cinder like-import files and `cinder_playlists/` are not;
+* `.scrobbler.log` upload is skipped (the player has WiFi; stock W. Music does not write that log);
+* a last-known drive letter is **not** swept if its volume serial no longer matches the catalog.
+
+How to connect:
+
+1. **microSD in a USB reader** — the usual ZX505 path (16 GB internal). Set destination to **sd**.
+   After the copy, on the player: W. Music ▸ Update Database. On a Mac the card appears under
+   `/Volumes/<label>/Music`.
+2. **ADB** (USB debugging) — if the unit allows it, re-detect mounts; dest URIs look like
+   `adb://SERIAL/sdcard/Music`. Works on Windows and macOS when `adb` is on PATH. Override the
+   binary with `SONY_SYNC_ADB`.
+3. **MTP File Transfer** — Windows only (Explorer's WALKMAN portable device), used when ADB is
+   locked. Slower, and skip-if-present is size-only. On a Mac with USB debugging locked, use the
+   card reader instead.
+
+Hearts / bookmarks inside W. Music live in Sony's private database and are not written by this
+tool. Last.fm and MusicBee likes still land as the **Liked Songs** playlist.
+
+---
+
+## Several Walkmans, one library
+
+The source library and album exclusions are shared. Each plugged player is its own profile,
+keyed by volume serial: mounts, dest (internal vs SD), cinder vs android-walkman, and disk
+budgets. Plug the Walkman you mean — Sony-sync matches it automatically. That unit's dest catalog
+and likes snapshot stay separate, so syncing a ZX505 cannot sweep an A50.
+
+On-device files (`cinder_*`, `Liked Songs.m3u8`, `listen_sources.conf`, `.scrobbler.log`) were
+already per disk. Rename the active player in Settings. A first-seen serial toasts
+`new Walkman: …`.
 
 ---
 
@@ -63,8 +122,14 @@ have to agree or nothing lines up.
 
 ### Setting it up
 
-1. **Last.fm** — put `LASTFM_API_KEY` / `LASTFM_API_SECRET` in `.env`, then `python -m likesync
-   login` (or the Last.fm screen in the UI). The session key is written back to `.env`.
+1. **Last.fm** — credentials are read from the Walkman first (`listen_sources.conf` at the
+   volume root, the same file Cinder / listen_pull uses: `lastfm_user`, `lastfm_api_key`,
+   `lastfm_api_secret`, `lastfm_session_key`). Any field that is empty there falls back to
+   `.env` (`LASTFM_API_KEY` / `LASTFM_API_SECRET` / `LASTFM_USERNAME` / `LASTFM_SESSION_KEY`).
+   Sign in with `python -m likesync login` or the Last.fm screen; that writes `.env`. AudioMuse
+   `audiomuse_url` / `audiomuse_token` follow the same device-then-PC rule (`AUDIOMUSE_URL` /
+   `AUDIOMUSE_TOKEN` in `.env`). Sony-sync pulls AudioMuse mixes and scores; Navidrome playlists
+   stay listen_pull's.
 2. **MusicBee** — make a playlist of what you love (an auto-playlist on `Love` or `Rating ≥ 4`
    works), then MusicBee ▸ right-click the playlist ▸ *auto-export as m3u* into the exported
    playlists folder. `likesync` finds anything named `Loved` / `Liked` / `Favourites` on its own,
@@ -98,6 +163,29 @@ header is honoured: that means "everything was unliked".
 
 ---
 
+## AudioMuse mixes and Channels scores
+
+Sony-sync owns the AudioMuse pull. Navidrome playlists stay with listen_pull. Same
+`listen_sources.conf` keys (`audiomuse_url` / `audiomuse_token`), then `.env`
+(`AUDIOMUSE_URL` / `AUDIOMUSE_TOKEN`).
+
+The menu item **AudioMuse: mixes + scores** calls `GET /api/playlists` and `GET /api/sync` and
+writes Cinder's next-boot imports at the internal volume root (`/contents`), not under `MUSIC/`:
+
+| file | what Cinder does |
+|---|---|
+| `cinder_playlist_import.tsv` | AudioMuse mixes (`am:` ids). Existing Navidrome rows in that file are kept. |
+| `cinder_audiomuse_import.tsv` | Channels scores (energy mapped onto 0–1 arousal). Copied to `cinder_audiomuse.tsv`. |
+
+It does not fetch OpenSubsonic playlists, and it does not write `.m3u8` into `MUSIC/` — Cinder
+resolves artist/title/album on boot. Android Walkmans skip this pull (no Cinder import). If
+AudioMuse is down, previous import files stay put so Navidrome rows are not wiped.
+
+After the pull, unplug and let Cinder boot so the mixes land in `cinder_playlists/` and the scores
+reach Channels.
+
+---
+
 ## The UI
 
 ```
@@ -123,7 +211,7 @@ of them headlessly against the real planner.
 ## Tests
 
 ```
-python -m unittest discover -s tests      # 42 tests: merge rules, tags, keys, TUI rendering
+python -m unittest discover -s tests      # merge rules, tags, keys, TUI, catalog, android dest
 ```
 
 The merge-rule tests are the ones that matter: they cover first run, removal propagation, an

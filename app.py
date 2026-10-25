@@ -19,8 +19,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import audiomuse
 import sync
 import tui
+import walkman
 from tui import DIM, ListView, Panel, Screen, fit, gauge, human_size, pad, rule, style, truncate
 
 try:
@@ -35,6 +37,14 @@ except Exception as exc:                      # the package is optional at runti
 # ───────────────────────────────────────────────────── background work
 
 @dataclass
+class WorkerSlot:
+    label: str = ""
+    filename: str = ""
+    done: int = 0
+    total: int = 0
+
+
+@dataclass
 class TaskProgress:
     message: str = ""
     current: int = 0
@@ -42,6 +52,12 @@ class TaskProgress:
     eta: float | None = None
     lines: list[str] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    dest_label: str = ""
+    copy_active: bool = False
+    copy_done: int = 0
+    copy_total: int = 0
+    copy_rate: float | None = None
+    workers: dict[str, WorkerSlot] = field(default_factory=dict)
 
     def note(self, message: str) -> None:
         with self.lock:
@@ -56,9 +72,41 @@ class TaskProgress:
                 self.lines.append(message)
                 del self.lines[:-200]
 
-    def snapshot(self) -> tuple[str, int, int, float | None, list[str]]:
+    def begin_copy(self, dest_label: str, total_bytes: int) -> None:
         with self.lock:
-            return self.message, self.current, self.total, self.eta, list(self.lines[-12:])
+            self.copy_active = True
+            self.dest_label = dest_label
+            self.copy_total = total_bytes
+            self.copy_done = 0
+            self.copy_rate = None
+            self.workers.clear()
+
+    def end_copy(self) -> None:
+        with self.lock:
+            self.copy_active = False
+            self.workers.clear()
+
+    def report_copy(self, done: int, total: int, rate: float | None, dest_label: str) -> None:
+        with self.lock:
+            self.copy_done, self.copy_total, self.copy_rate = done, total, rate
+            if dest_label:
+                self.dest_label = dest_label
+
+    def set_worker(self, slot_id: str, label: str, filename: str, done: int, total: int) -> None:
+        with self.lock:
+            self.workers[slot_id] = WorkerSlot(label, filename, done, total)
+
+    def clear_worker(self, slot_id: str) -> None:
+        with self.lock:
+            self.workers.pop(slot_id, None)
+
+    def snapshot(self) -> tuple:
+        with self.lock:
+            return (
+                self.message, self.current, self.total, self.eta, list(self.lines[-12:]),
+                self.dest_label, self.copy_active, self.copy_done, self.copy_total,
+                self.copy_rate, dict(self.workers),
+            )
 
 
 def format_eta(seconds: float | None) -> str:
@@ -103,14 +151,32 @@ def run_task(screen: Screen, title: str, work, progress: TaskProgress | None = N
 def render_task(screen: Screen, title: str, progress: TaskProgress, frame: int,
                 finished: bool = False) -> list[str]:
     width, height = screen.size
-    message, current, total, eta, recent = progress.snapshot()
+    (message, current, total, eta, recent, dest_label, copy_active,
+     copy_done, copy_total, copy_rate, workers) = progress.snapshot()
     spin = tui.SPINNER[frame % len(tui.SPINNER)]
+    heading = f" {title}"
+    if dest_label and copy_active:
+        heading = f" {title}  →  {dest_label}"
     lines = [
-        style(fit(f" {title}", width), fg="black", bg="bar", bold=True) if tui.COLOUR
-        else fit(f" {title}", width),
+        style(fit(heading, width), fg="black", bg="bar", bold=True) if tui.COLOUR
+        else fit(heading, width),
         "",
     ]
-    if total:
+    if copy_active and copy_total:
+        fraction = min(copy_done / copy_total, 1.0)
+        bar_width = max(width - 42, 10)
+        rate = f"{copy_rate / (1024 * 1024):.0f} MB/s" if copy_rate else "-- MB/s"
+        lines.append(
+            f"  {style(tui.bar(fraction, bar_width), fg='amber')} "
+            f"{human_size(copy_done)} / {human_size(copy_total)}  {rate}  ETA {format_eta(eta)}"
+        )
+        for slot in workers.values():
+            file_frac = min(slot.done / slot.total, 1.0) if slot.total else 0
+            lines.append(
+                f"  {fit(slot.label, 10)} {style(tui.bar(file_frac, max(width - 48, 8)), fg='cyan')} "
+                f"{fit(slot.filename, 22)}  {human_size(slot.done)} / {human_size(slot.total)}"
+            )
+    elif total:
         fraction = min(current / total, 1.0)
         bar_width = max(width - 34, 10)
         lines.append(f"  {style(tui.bar(fraction, bar_width), fg='amber')} "
@@ -120,7 +186,7 @@ def render_task(screen: Screen, title: str, progress: TaskProgress, frame: int,
     lines.append(f"  {style(truncate(message, width - 4), dim=True)}")
     lines.append("")
     lines.append(f"  {style('recent', dim=True)}")
-    for entry in recent[-(height - 10):]:
+    for entry in recent[-(height - 12):]:
         lines.append(f"    {style(truncate(entry, width - 6), dim=True)}")
     return lines
 
@@ -133,13 +199,16 @@ def source_used(report: sync.ScanReport, config: sync.AppConfig, drive: str) -> 
 
 
 def render_header(app: "App", width: int) -> list[str]:
-    device = "connected" if os.path.isdir(app.config.internal_drive) else "not connected"
+    device = "connected" if app.config.dest_is_connected() else "not connected"
     device_style = "green" if device == "connected" else "grey"
+    name = app.config.device_name or "walkman"
     user = app.lastfm_user or "not signed in"
     left = " WALKMAN SYNC"
-    right = f"{style('walkman', dim=True)} {style(device, fg=device_style)}   " \
+    right = f"{style('walkman', dim=True)} {name} {style(device, fg=device_style)}   " \
             f"{style('last.fm', dim=True)} {user} "
-    gap = max(width - tui.cell_width(left) - tui.cell_width(right), 1)
+    budget = max(width - tui.cell_width(left) - 1, 0)
+    right = tui.fit(right, budget)
+    gap = max(width - tui.cell_width(left) - tui.cell_width(right), 0)
     header = left + " " * gap + right
     return [style(header, bold=True) if tui.COLOUR else header,
             style(rule(width), fg="grey")]
@@ -156,16 +225,28 @@ def render_dashboard(app: "App") -> list[str]:
     # ── left: what is on the device ─────────────────────────────
     internal_used = source_used(report, config, config.internal_drive) if report else 0
     sd_used = source_used(report, config, config.sd_drive) if report else 0
+    dest = config.dest_drive
+    internal_cap = config.internal_max_bytes or 1
+    sd_cap = config.sd_max_bytes or 1
+    internal_mark = " dest" if os.path.normcase(dest) == os.path.normcase(config.internal_drive) else " unused"
+    sd_mark = " dest" if os.path.normcase(dest) == os.path.normcase(config.sd_drive) else " unused"
+    internal_total = human_size(internal_cap)
+    sd_total = human_size(sd_cap)
     device_rows = [
-        f"Internal  {gauge(internal_used, config.internal_max_bytes, 18)} "
-        f"{human_size(internal_used)} / {config.internal_max_gb:.0f} GB",
-        f"SD card   {gauge(sd_used, config.sd_max_bytes, 18)} "
-        f"{human_size(sd_used)} / {config.sd_max_gb:.0f} GB",
+        f"Internal  {gauge(internal_used, internal_cap, 14)} "
+        f"{human_size(internal_used)} / {internal_total}{style(internal_mark, fg='green' if 'dest' in internal_mark else None, dim='dest' not in internal_mark)}",
+        f"SD card   {gauge(sd_used, sd_cap, 14)} "
+        f"{human_size(sd_used)} / {sd_total}{style(sd_mark, fg='green' if 'dest' in sd_mark else None, dim='dest' not in sd_mark)}",
         "",
         f"Source    {human_size(report.source_total_bytes) if report else '—'}"
         f"   {len(report.plan.source_artists) if report and report.plan else 0} albums",
         f"Excluded  {sync.format_album_exclusion_summary(config.excluded_album_entries)}",
+        style(sync.catalog_index_line(config, report), dim=True),
     ]
+    if report and sd_mark.strip() == "unused" and sd_used:
+        device_rows.append(style("SD leftover will be cleared", fg="yellow"))
+    if report and internal_mark.strip() == "unused" and internal_used:
+        device_rows.append(style("Internal leftover will be cleared", fg="yellow"))
     device_panel = Panel("Storage", device_rows, accent="cyan").render(column)
 
     # ── right: what this run would change ───────────────────────
@@ -191,14 +272,19 @@ def render_dashboard(app: "App") -> list[str]:
         change_rows.append(f"Files to remove {len(report.stale_music_files)}")
         change_rows.append(f"Playlists       {len(report.plan.playlist_drive)} placed, "
                            f"{len(report.stale_playlists)} stale")
-        duplicates = len(report.duplicate_tracks)
-        if duplicates:
-            change_rows.append(style(f"Duplicates      {duplicates}", fg="yellow"))
+        groups = len(report.duplicate_groups)
+        auto = sum(1 for group in report.duplicate_groups if group.auto_fix)
+        if groups:
+            change_rows.append(style(f"Duplicates      {groups} ({auto} auto-fix)", fg="yellow"))
         for label, info in sync.overflow_warnings(config, report):
             change_rows.append(style(f"OVERFLOW {label}: short {human_size(info.shortfall_bytes)}",
                                      fg="red", bold=True))
     change_panel = Panel("This sync", change_rows, accent="amber").render(column)
-    likes_panel = Panel("Likes", app.likes_summary_rows(), accent="magenta").render(column)
+    likes_panel = Panel(
+        "Likes",
+        app.likes_summary_rows() + [""] + app.audiomuse_summary_rows(),
+        accent="magenta",
+    ).render(column)
     scrobble_panel = Panel("Scrobbles", app.scrobble_summary_rows(), accent="green").render(column)
     if narrow:
         storage_row = device_panel + change_panel
@@ -289,10 +375,13 @@ class App:
             ("3", "Album plan", "albums"),
             ("4", "Playlists", "playlists"),
             ("5", "Pending removals", "removals"),
-            ("6", "Duplicates across drives", "duplicates"),
+            ("6", "Duplicates on the Walkman", "duplicates"),
             ("7", "Likes: device ⇄ Last.fm ⇄ MusicBee", "likes"),
             ("8", "Scrobbles: upload to Last.fm", "scrobbles"),
+            ("a", "AudioMuse: mixes + scores", "audiomuse"),
             ("9", "Clean up stale files", "cleanup"),
+            ("i", "Index library", "index_library"),
+            ("w", "Index Walkman", "index_walkman"),
             ("s", "Settings", "settings"),
             ("l", "Last.fm account", "lastfm"),
             ("q", "Quit", "quit"),
@@ -332,13 +421,35 @@ class App:
             rows.append(style("nothing to upload — plug the Walkman in", dim=True))
         return rows
 
+    def audiomuse_summary_rows(self) -> list[str]:
+        rows = audiomuse.status_rows(self.config)
+        if not rows:
+            return [style("AudioMuse  not configured", dim=True)]
+        if rows[0] == "not configured":
+            return [style("AudioMuse  not configured", dim=True)]
+        if rows[0].startswith("skipped"):
+            return [style("AudioMuse  " + rows[0], dim=True)]
+        return ["AudioMuse  " + rows[0]] + [style(line, dim=True) for line in rows[1:]]
+
     # ── scanning ────────────────────────────────────────────────
     def rescan(self) -> None:
+        new_name = ""
+        if self.config.refresh_drives():
+            try:
+                self.config.persist()
+            except OSError:
+                pass
+            new_name = self.config.new_walkman
+            self.config.new_walkman = ""
+        else:
+            self.config.pull_listen_credentials()
         def work(progress: TaskProgress):
             return sync.build_scan_report(self.config, status=progress.note)
         self.report = run_task(self.screen, "Scanning library and device", work)
         if self.report and self.report.plan is None:
             self.toast = "scan failed — check the source and playlist paths in Settings"
+        elif new_name:
+            self.toast = f"new Walkman: {new_name}"
         else:
             self.toast = ""
 
@@ -410,12 +521,30 @@ class App:
             self.likes = LikesSession()
         return True
 
+    # ── actions: catalog ────────────────────────────────────────
+    def do_index_library(self) -> None:
+        result = run_task(
+            self.screen, "Indexing library",
+            lambda p: sync.index_library(self.config, status=p.note),
+        )
+        screen_text(self, "Library index", result_rows(result))
+        self.rescan()
+
+    def do_index_walkman(self) -> None:
+        result = run_task(
+            self.screen, "Indexing Walkman",
+            lambda p: sync.index_walkman(self.config, status=p.note),
+        )
+        screen_text(self, "Walkman index", result_rows(result))
+        self.rescan()
+
     # ── actions: music sync ─────────────────────────────────────
     def do_sync(self) -> None:
         if not self.ensure_report():
             return
         preview = run_task(self.screen, "Sync preview", lambda p: sync.sync_library(
-            self.config, dry_run=True, progress_callback=p.step))
+            self.config, dry_run=True, progress_callback=p.step, progress_ui=p,
+            device_scans=self.report.device_scans, plan=self.report.plan))
         rows = result_rows(preview)
         warnings = sync.overflow_warnings(self.config, self.report)
         for label, info in warnings:
@@ -427,7 +556,8 @@ class App:
             return
         try:
             result = run_task(self.screen, "Syncing", lambda p: sync.sync_library(
-                self.config, dry_run=False, progress_callback=p.step))
+                self.config, dry_run=False, progress_callback=p.step, progress_ui=p,
+                device_scans=self.report.device_scans, plan=self.report.plan))
         except OSError as exc:
             self.pause_message("Sync stopped — not enough free space", [str(exc)])
             self.rescan()
@@ -439,12 +569,14 @@ class App:
         if not self.ensure_report():
             return
         preview = run_task(self.screen, "Cleanup preview", lambda p: sync.cleanup_library(
-            self.config, dry_run=True, progress_callback=p.step))
+            self.config, dry_run=True, progress_callback=p.step,
+            device_scans=self.report.device_scans, plan=self.report.plan))
         screen_text(self, "Cleanup preview", result_rows(preview))
         if not self.confirm("Delete the stale files listed above?"):
             return
         result = run_task(self.screen, "Cleaning up", lambda p: sync.cleanup_library(
-            self.config, dry_run=False, progress_callback=p.step))
+            self.config, dry_run=False, progress_callback=p.step,
+            device_scans=self.report.device_scans, plan=self.report.plan))
         screen_text(self, "Cleanup complete", result_rows(result))
         self.rescan()
 
@@ -510,8 +642,15 @@ class App:
     def do_duplicates(self) -> None:
         if not self.ensure_report():
             return
-        rows = [f"  {path}" for path in self.report.duplicate_tracks] or ["none"]
-        screen_text(self, f"Duplicates across drives ({len(self.report.duplicate_tracks)})", rows)
+        groups = self.report.duplicate_groups or []
+        rows: list[str] = []
+        for group in groups:
+            mark = "auto-fix" if group.auto_fix else "inbox"
+            rows.append(style(f"{group.kind}  {mark}  {group.key}", bold=True))
+            rows += [f"  {path}" for path in group.paths]
+        if not rows:
+            rows = ["none"]
+        screen_text(self, f"Duplicates ({len(groups)})", rows)
 
     # ── actions: scrobbles ──────────────────────────────────────
     def do_scrobbles(self) -> None:
@@ -535,6 +674,37 @@ class App:
         result = run_task(self.screen, "Uploading scrobbles", lambda p: sync.upload_scrobbles(
             self.config, dry_run=False, progress_callback=p.step, retries=3))
         screen_text(self, "Scrobble upload complete", result_rows(result))
+
+    def do_audiomuse(self) -> None:
+        self.config.pull_listen_credentials()
+        if self.config.is_android:
+            self.toast = "AudioMuse skipped (android-walkman)"
+            return
+        if not audiomuse.configured(self.config):
+            self.toast = "AudioMuse not configured"
+            return
+        preview = run_task(
+            self.screen, "Fetching AudioMuse",
+            lambda p: audiomuse.prepare(self.config, progress=p.note),
+        )
+        if preview.skipped:
+            self.toast = preview.skipped
+            return
+        if preview.error:
+            self.pause_message("AudioMuse failed", audiomuse.preview_rows(preview))
+            return
+        screen_text(self, "AudioMuse preview — nothing written yet", audiomuse.preview_rows(preview))
+        if not self.confirm("Write mixes and scores to the Walkman?"):
+            self.toast = "AudioMuse cancelled"
+            return
+        result = run_task(
+            self.screen, "Writing AudioMuse imports",
+            lambda p: audiomuse.commit(preview, dry_run=False),
+        )
+        if result.error:
+            self.pause_message("AudioMuse failed", audiomuse.preview_rows(result))
+            return
+        screen_text(self, "AudioMuse complete", audiomuse.preview_rows(result))
 
     # ── actions: likes ──────────────────────────────────────────
     def do_likes(self) -> None:
@@ -615,28 +785,57 @@ class App:
     # ── actions: settings ───────────────────────────────────────
     def do_settings(self) -> None:
         fields = [
+            ("Index library", "", "index_library"),
+            ("Index Walkman", "", "index_walkman"),
             ("Source library", "source_dir", "path"),
             ("Playlist folder", "playlist_dir", "path"),
-            ("Internal music path", "internal_drive", "path"),
-            ("SD card music path", "sd_drive", "path"),
-            ("Internal limit (GB)", "internal_max_gb", "float"),
+            ("Walkman name", "device_name", "name"),
+            ("Other Walkmans", "", "known"),
+            ("Destination (internal/sd/auto)", "dest", "dest"),
+            ("Device (cinder / android-walkman)", "device_kind", "kind"),
+            ("Walkman mounts", "", "detect"),
+            ("Internal", "internal_drive", "mount"),
+            ("SD card", "sd_drive", "mount"),
+            ("Internal limit GB (0=live)", "internal_max_gb", "float"),
             ("Internal safety buffer (GB)", "internal_safety_buffer_gb", "float"),
-            ("SD limit (GB)", "sd_max_gb", "float"),
+            ("SD limit GB (0=live)", "sd_max_gb", "float"),
+            ("Copy workers", "copy_workers", "int"),
             ("Excluded albums", "excluded_albums", "albums"),
-            ("Re-detect Walkman drives", "", "detect"),
         ]
         view = ListView(items=[])
         while True:
-            view.items = [f"{fit(label, 30)} {style(str(getattr(self.config, attr, '')), dim=True)}"
-                          if attr else style(label, fg="cyan")
-                          for label, attr, _ in fields]
+            view.items = []
+            for label, attr, kind in fields:
+                if kind == "detect":
+                    mode = "auto — ⏎ refresh" if self.config.auto_detect_drives else "pinned — ⏎ re-enable auto"
+                    view.items.append(f"{fit(label, 30)} {style(mode, fg='cyan')}")
+                elif kind == "known":
+                    others = self.config.other_device_names()
+                    view.items.append(
+                        f"{fit(label, 30)} {style(', '.join(others) if others else 'none', dim=True)}"
+                    )
+                elif kind in ("index_library", "index_walkman"):
+                    view.items.append(f"{fit(label, 30)} {style('⏎ run', fg='cyan')}")
+                elif kind == "mount":
+                    view.items.append(
+                        f"{fit(label, 30)} {style(sync.describe_mount(getattr(self.config, attr)), dim=True)}"
+                    )
+                elif attr:
+                    view.items.append(
+                        f"{fit(label, 30)} {style(str(getattr(self.config, attr, '')), dim=True)}"
+                    )
+                else:
+                    view.items.append(style(label, fg="cyan"))
             width, height = self.screen.size
             lines = render_header(self, width)
             lines.append(style(fit(" Settings", width), bold=True))
             body = max(height - 7, 4)
             lines += view.render(width, body)
             lines.append(style(rule(width), fg="grey"))
-            lines.append(tui.key_hint([("⏎", "edit"), ("esc", "back")], width))
+            lines.append(tui.key_hint(
+                [("⏎", "edit / refresh mounts"), ("esc", "back")], width))
+            if self.toast:
+                lines.append(style(fit("  " + self.toast, width), fg="amber"))
             self.screen.draw(lines)
 
             key = tui.read_key()
@@ -650,9 +849,38 @@ class App:
             if index is None:
                 continue
             label, attr, kind = fields[index]
+            if kind == "index_library":
+                self.do_index_library()
+                continue
+            if kind == "index_walkman":
+                self.do_index_walkman()
+                continue
+            if kind == "known":
+                continue
             if kind == "detect":
                 sync.autodetect_storage_paths(self.config)
-                self.toast = f"internal {self.config.internal_drive}, sd {self.config.sd_drive}"
+                if self.config.internal_drive or self.config.sd_drive:
+                    self.toast = (
+                        f"{sync.describe_mount(self.config.internal_drive)}  |  "
+                        f"{sync.describe_mount(self.config.sd_drive)}"
+                    )
+                else:
+                    self.toast = "Walkman not found — plug it in and press Enter again"
+                continue
+            if kind == "mount":
+                current = getattr(self.config, attr)
+                answer = self.screen.prompt(
+                    f"{label} [{current}] (blank keeps auto-detect): "
+                ).strip()
+                if not answer:
+                    continue
+                setattr(self.config, attr, answer)
+                self.config.auto_detect_drives = False
+                try:
+                    self.config.persist()
+                    self.toast = f"pinned {label.lower()} — auto-detect off"
+                except OSError as exc:
+                    self.toast = f"could not save: {exc}"
                 continue
             if kind == "albums":
                 self.edit_exclusions()
@@ -665,8 +893,34 @@ class App:
                     setattr(self.config, attr, float(answer))
                 except ValueError:
                     self.toast = "not a number"
+                    continue
+            elif kind == "int":
+                try:
+                    setattr(self.config, attr, max(int(answer), 1))
+                except ValueError:
+                    self.toast = "not a number"
+                    continue
+            elif kind == "dest":
+                value = answer.strip().lower()
+                if value not in ("internal", "sd", "auto"):
+                    self.toast = "use internal, sd, or auto"
+                    continue
+                self.config.dest = value
+            elif kind == "kind":
+                value = answer.strip().lower().replace(" ", "-")
+                if value in ("android", "zx500", "a100"):
+                    value = "android-walkman"
+                if value not in ("cinder", "android-walkman"):
+                    self.toast = "use cinder or android-walkman"
+                    continue
+                self.config.device_kind = value
             else:
                 setattr(self.config, attr, answer)
+            try:
+                self.config.persist()
+                self.toast = "saved"
+            except OSError as exc:
+                self.toast = f"could not save: {exc}"
 
     def edit_exclusions(self) -> None:
         """Pick excluded albums from the real source list, with a filter — no typing names."""
@@ -704,7 +958,7 @@ class App:
                 value = ", ".join(sorted(selected, key=str.lower))
                 self.config.excluded_albums = value
                 try:
-                    sync.save_env_value("SYNC_EXCLUDED_ALBUMS", value)
+                    self.config.persist()
                     self.toast = f"saved {len(selected)} exclusion(s)"
                 except OSError as exc:
                     self.toast = f"could not save: {exc}"
@@ -714,11 +968,14 @@ class App:
     def do_lastfm(self) -> None:
         while True:
             width, height = self.screen.size
+            origin = "Walkman" if os.environ.get("WALKMAN_SYNC_LASTFM_FROM") == "device" \
+                else ".env"
             rows = [
                 f"User    {self.lastfm_user or style('not signed in', fg='yellow')}",
                 f"API key {sync.mask_secret(self.config.lastfm_api_key)}",
                 f"Secret  {sync.mask_secret(self.config.lastfm_api_secret)}",
                 f"Session {'ready' if os.environ.get('LASTFM_SESSION_KEY') else style('missing', fg='yellow')}",
+                style(f"Source  {origin}  (device listen_sources.conf, else PC .env)", dim=True),
             ]
             lines = render_header(self, width)
             lines.append(style(fit(" Last.fm account", width), bold=True))
@@ -816,6 +1073,17 @@ def album_diff_rows(config: sync.AppConfig, report: sync.ScanReport) -> list[str
                               f"{sync.drive_label(to_drive, config)}", fg="yellow"))
     if diff.unchanged_count:
         rows.append(style(f"{diff.unchanged_count} album(s) unchanged", dim=True))
+    other_stale = [
+        path for path in report.stale_music_files
+        if sync.is_path_within_root(path, config.other_drive)
+    ]
+    if other_stale:
+        rows.append(style(
+            f"{sync.drive_label(config.other_drive, config)} → "
+            f"{sync.drive_label(config.dest_drive, config)}: "
+            f"{len(other_stale)} file(s) will be removed from the unused volume",
+            fg="yellow",
+        ))
     return rows
 
 
@@ -852,6 +1120,8 @@ def likes_rows(plan) -> list[str]:
 
 
 def main() -> int:
+    walkman.ensure_repo_cwd()
+    tui.prepare_console()
     app = App()
     try:
         app.run()
@@ -864,4 +1134,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(tui.run_with_hold(main))

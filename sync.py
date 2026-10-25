@@ -9,8 +9,7 @@ import ctypes
 import time
 import unicodedata
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -18,9 +17,19 @@ from urllib import error, parse, request
 import xml.etree.ElementTree as ET
 from ctypes import wintypes
 
+import catalog as catalog_mod
+import copyutil
+import contentkey as contentkey_mod
+import manifest as manifest_mod
+import storage as storage_mod
+import walkman as walkman_mod
 
-def load_local_env(env_path: str = ".env") -> None:
-    path = Path(env_path)
+
+ENV_PATH = walkman_mod.REPO_ROOT / ".env"
+
+
+def load_local_env(env_path: str | Path | None = None) -> None:
+    path = Path(env_path) if env_path is not None else ENV_PATH
     if not path.exists():
         return
 
@@ -37,9 +46,9 @@ def load_local_env(env_path: str = ".env") -> None:
 load_local_env()
 
 
-def save_env_value(key: str, value: str, env_path: str = ".env") -> None:
+def save_env_value(key: str, value: str, env_path: str | Path | None = None) -> None:
     """Write or update a single KEY="value" entry in the .env file."""
-    path = Path(env_path)
+    path = Path(env_path) if env_path is not None else ENV_PATH
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     updated = False
     new_lines: list[str] = []
@@ -57,121 +66,78 @@ def save_env_value(key: str, value: str, env_path: str = ".env") -> None:
     os.environ[key] = value
 
 
-def iter_windows_drives() -> list[str]:
-    # Guarded so this module can be imported (and unit-tested) off Windows; drive detection is
-    # the only Windows-only part of the planner, and everything else works from plain paths.
-    if os.name != "nt":
-        return []
-    drives: list[str] = []
-    mask = ctypes.windll.kernel32.GetLogicalDrives()
-    for index in range(26):
-        if mask & (1 << index):
-            drives.append(f"{chr(65 + index)}:\\")
-    return drives
-
-
-def get_volume_label(drive_root: str) -> str:
-    if os.name != "nt":
-        return ""
-    volume_name = ctypes.create_unicode_buffer(261)
-    fs_name = ctypes.create_unicode_buffer(261)
-    serial = wintypes.DWORD()
-    max_comp = wintypes.DWORD()
-    flags = wintypes.DWORD()
-    ok = ctypes.windll.kernel32.GetVolumeInformationW(
-        ctypes.c_wchar_p(drive_root),
-        volume_name,
-        len(volume_name),
-        ctypes.byref(serial),
-        ctypes.byref(max_comp),
-        ctypes.byref(flags),
-        fs_name,
-        len(fs_name),
-    )
-    return volume_name.value.strip() if ok else ""
-
-
-def resolve_music_path(drive_root: str) -> str:
-    for folder_name in ("MUSIC", "Music"):
-        candidate = os.path.join(drive_root, folder_name)
-        if os.path.isdir(candidate):
-            return candidate
-    return os.path.join(drive_root, "Music")
-
-
-def detect_walkman_paths() -> tuple[str, str]:
-    internal_path = r"D:\Music"
-    sd_path = r"E:\Music"
-    candidates: list[tuple[str, str, int]] = []
-
-    for drive_root in iter_windows_drives():
-        label = get_volume_label(drive_root)
-        try:
-            total_bytes = shutil.disk_usage(drive_root).total
-        except OSError:
-            continue
-        candidates.append((drive_root, label, total_bytes))
-
-    walkman_root = next(
-        (drive for drive, label, _ in candidates if label.strip().upper() == "WALKMAN"),
-        None,
-    )
-    if walkman_root:
-        internal_path = resolve_music_path(walkman_root)
-
-    sd_root = next(
-        (
-            drive
-            for drive, label, total_bytes in candidates
-            if drive != walkman_root
-            and (
-                label.strip().upper() == "32 GB"
-                or 28 * 1024**3 <= total_bytes <= 36 * 1024**3
-            )
-        ),
-        None,
-    )
-    if sd_root:
-        sd_path = resolve_music_path(sd_root)
-
-    return internal_path, sd_path
+iter_windows_drives = walkman_mod.iter_windows_drives
+get_volume_label = walkman_mod.get_volume_label
+resolve_music_path = walkman_mod.resolve_music_path
+detect_walkman_paths = walkman_mod.detect_walkman_paths
+describe_mount = walkman_mod.describe_mount
 
 # ================= DEFAULT CONFIGURATION =================
-DEFAULT_SOURCE_DIR = r"C:\Users\ABDPa\Music\my music lossless"
-DEFAULT_PLAYLIST_DIR = r"C:\Users\ABDPa\Music\Exported Playlists"
-DEFAULT_INTERNAL_DRIVE, DEFAULT_SD_DRIVE = detect_walkman_paths()
-DEFAULT_SOURCE_DIR = os.environ.get("SYNC_SOURCE_DIR", DEFAULT_SOURCE_DIR)
-DEFAULT_PLAYLIST_DIR = os.environ.get("SYNC_PLAYLIST_DIR", DEFAULT_PLAYLIST_DIR)
-DEFAULT_INTERNAL_DRIVE = os.environ.get("SYNC_INTERNAL_DRIVE", DEFAULT_INTERNAL_DRIVE)
-DEFAULT_SD_DRIVE = os.environ.get("SYNC_SD_DRIVE", DEFAULT_SD_DRIVE)
+_SETTINGS = walkman_mod.SyncSettings.load()
+DEFAULT_SOURCE_DIR = r"\\WillineauVault\Music"
+DEFAULT_PLAYLIST_DIR = r"\\WillineauVault\Music"
+DEFAULT_INTERNAL_DRIVE, DEFAULT_SD_DRIVE = detect_walkman_paths(use_env=True)
+DEFAULT_SOURCE_DIR = walkman_mod.resolve_library_path(
+    os.environ.get("SYNC_SOURCE_DIR", _SETTINGS.source_dir or DEFAULT_SOURCE_DIR))
+DEFAULT_PLAYLIST_DIR = walkman_mod.resolve_library_path(
+    os.environ.get("SYNC_PLAYLIST_DIR", _SETTINGS.playlist_dir or DEFAULT_PLAYLIST_DIR))
+DEFAULT_AUTO_DETECT_DRIVES = bool(getattr(_SETTINGS, "auto_detect_drives", True))
+if not DEFAULT_AUTO_DETECT_DRIVES:
+    if _SETTINGS.internal_drive:
+        DEFAULT_INTERNAL_DRIVE = _SETTINGS.internal_drive
+    if _SETTINGS.sd_drive:
+        DEFAULT_SD_DRIVE = _SETTINGS.sd_drive
+    DEFAULT_INTERNAL_DRIVE = os.environ.get("SYNC_INTERNAL_DRIVE", DEFAULT_INTERNAL_DRIVE)
+    DEFAULT_SD_DRIVE = os.environ.get("SYNC_SD_DRIVE", DEFAULT_SD_DRIVE)
+else:
+    # Last-known letters if the Walkman is unplugged this boot.
+    if not DEFAULT_INTERNAL_DRIVE and _SETTINGS.internal_drive:
+        DEFAULT_INTERNAL_DRIVE = _SETTINGS.internal_drive
+    if not DEFAULT_SD_DRIVE and _SETTINGS.sd_drive:
+        DEFAULT_SD_DRIVE = _SETTINGS.sd_drive
+walkman_mod.apply_listen_credentials(DEFAULT_INTERNAL_DRIVE, DEFAULT_SD_DRIVE)
 DEFAULT_LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
 DEFAULT_LASTFM_API_SECRET = os.environ.get("LASTFM_API_SECRET", "")
 DEFAULT_LASTFM_USERNAME = os.environ.get("LASTFM_USERNAME", "")
 DEFAULT_LASTFM_SESSION_KEY = os.environ.get("LASTFM_SESSION_KEY", "")
-DEFAULT_INTERNAL_MAX_GB = 54
+DEFAULT_AUDIOMUSE_URL = os.environ.get("AUDIOMUSE_URL", "")
+DEFAULT_AUDIOMUSE_TOKEN = os.environ.get("AUDIOMUSE_TOKEN", "")
+DEFAULT_DEST = _SETTINGS.dest or walkman_mod.DEST_AUTO
+DEFAULT_INTERNAL_MAX_GB = float(_SETTINGS.internal_max_gb or 0)
 DEFAULT_INTERNAL_SAFETY_BUFFER_GB = 0
-DEFAULT_SD_MAX_GB = 29
-DEFAULT_EXCLUDED_ALBUMS = os.environ.get("SYNC_EXCLUDED_ALBUMS", "")
+DEFAULT_SD_MAX_GB = float(_SETTINGS.sd_max_gb or 0)
+DEFAULT_EXCLUDED_ALBUMS = os.environ.get("SYNC_EXCLUDED_ALBUMS", _SETTINGS.excluded_albums)
+DEFAULT_ACTIVE_DEVICE = getattr(_SETTINGS, "active_device", "") or ""
+_ACTIVE_PROFILE = _SETTINGS.active_profile() if hasattr(_SETTINGS, "active_profile") else None
+DEFAULT_DEVICE_NAME = _ACTIVE_PROFILE.name if _ACTIVE_PROFILE and _ACTIVE_PROFILE.name else ""
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 
 # Supported audio extensions
-AUDIO_EXT = (".flac", ".wav", ".mp3", ".m4a", ".aac", ".alac")
+AUDIO_EXT = walkman_mod.AUDIO_EXT
+DEFAULT_DEVICE_KIND = getattr(_SETTINGS, "device_kind", walkman_mod.KIND_CINDER) or walkman_mod.KIND_CINDER
 PLAYLIST_EXT = (".m3u", ".m3u8")
-# Playlists owned by `likesync`, not by this planner. They must be excluded at BOTH ends:
-# as a *source* playlist "Liked Songs" spans the whole library, and the placement algorithm
-# unions every album a playlist touches into one group — one liked list would therefore force
-# the entire library onto a single drive. As a *device* playlist it is not in the plan, so the
-# stale sweep would delete it on the next run. Both are handled by this one set.
+# Playlists owned by `likesync`, not by this planner. Excluded from the source playlist
+# scan and from the stale sweep so likesync can write Liked Songs on dest without us
+# deleting it on the next run.
 MANAGED_PLAYLISTS = {"liked songs.m3u8", "liked songs.m3u"}
+CINDER_PLAYLISTS_DIR = "cinder_playlists"
+CINDER_PRESERVE_PREFIXES = ("cinder_", "listen_")
+CINDER_PRESERVE_NAMES = {
+    "listen_sources.conf",
+    "listen_sync_state.json",
+    ".scrobbler.log",
+    "scrobble.logs",
+    manifest_mod.MANIFEST_NAME,
+}
 ALBUM_SELECTION_PAGE_SIZE = 15
-# Parallel workers for the copy phase (I/O-bound on USB flash).
-COPY_WORKERS = 4
-# Headroom kept free on each device so the filesystem never fills to 0 bytes; this
-# is the safety margin that guards against overflowing a drive during the copy phase.
-COPY_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
+# One writer onto the dest LUN by default. Extra writers on the same flash often lose.
+COPY_WORKERS = max(int(os.environ.get("SYNC_COPY_WORKERS", _SETTINGS.copy_workers or 1)), 1)
+COPY_SPACE_RESERVE_BYTES = walkman_mod.COPY_SPACE_RESERVE_BYTES
+HEADROOM_BYTES = walkman_mod.HEADROOM_BYTES
 # exFAT/FAT store modification times at 2-second granularity, so a freshly copied file
 # can read back up to ~2s off its source. Allow that slack before calling a file "newer".
 MTIME_TOLERANCE_SECONDS = 2
+MANIFEST_SAVE_EVERY = 50
 # =======================================================
 
 
@@ -184,31 +150,184 @@ class AppConfig:
     playlist_dir: str = DEFAULT_PLAYLIST_DIR
     internal_drive: str = DEFAULT_INTERNAL_DRIVE
     sd_drive: str = DEFAULT_SD_DRIVE
+    dest: str = DEFAULT_DEST
     lastfm_api_key: str = DEFAULT_LASTFM_API_KEY
     lastfm_api_secret: str = DEFAULT_LASTFM_API_SECRET
     lastfm_username: str = DEFAULT_LASTFM_USERNAME
     lastfm_session_key: str = DEFAULT_LASTFM_SESSION_KEY
+    audiomuse_url: str = DEFAULT_AUDIOMUSE_URL
+    audiomuse_token: str = DEFAULT_AUDIOMUSE_TOKEN
     internal_max_gb: float = DEFAULT_INTERNAL_MAX_GB
     internal_safety_buffer_gb: float = DEFAULT_INTERNAL_SAFETY_BUFFER_GB
     sd_max_gb: float = DEFAULT_SD_MAX_GB
     excluded_albums: str = DEFAULT_EXCLUDED_ALBUMS
+    copy_workers: int = COPY_WORKERS
+    auto_detect_drives: bool = DEFAULT_AUTO_DETECT_DRIVES
+    device_kind: str = DEFAULT_DEVICE_KIND
+    active_device: str = DEFAULT_ACTIVE_DEVICE
+    device_name: str = DEFAULT_DEVICE_NAME
+    new_walkman: str = ""
+
+    @property
+    def is_android(self) -> bool:
+        return self.device_kind == walkman_mod.KIND_ANDROID
+
+    @property
+    def is_cinder(self) -> bool:
+        return not self.is_android
+
+    def dest_is_connected(self) -> bool:
+        return bool(self.dest_drive) and storage_mod.isdir(self.dest_drive)
+
+    def other_device_names(self) -> list[str]:
+        return _SETTINGS.other_device_names()
+
+    def apply_device_profile(self, settings: walkman_mod.SyncSettings | None = None) -> None:
+        """Copy the active Walkman profile onto this config's dest/kind/mounts/budgets."""
+        settings = settings or _SETTINGS
+        profile = settings.active_profile()
+        self.active_device = settings.active_device
+        if profile is None:
+            return
+        self.internal_drive = profile.internal_drive
+        self.sd_drive = profile.sd_drive
+        self.dest = profile.dest
+        self.device_kind = profile.device_kind
+        self.internal_max_gb = profile.internal_max_gb
+        self.sd_max_gb = profile.sd_max_gb
+        self.device_name = profile.name
+
+    def refresh_drives(self) -> bool:
+        """Replace mount points from a live Walkman scan. Keeps last-known if unplugged."""
+        if not self.auto_detect_drives:
+            return False
+        android = self.is_android
+        internal, sd = walkman_mod.detect_walkman_paths(use_env=False, android=android)
+        if not internal and not sd:
+            remote_internal, remote_sd = storage_mod.detect_android_mounts()
+            if remote_internal or remote_sd:
+                internal, sd = remote_internal, remote_sd
+                android = True
+        if not internal and not sd:
+            return False
+        roots = walkman_mod.detect_walkman_roots(use_env=False)
+        inferred = walkman_mod.infer_device_kind(
+            internal if storage_mod.is_remote(internal) else roots[0],
+            sd if storage_mod.is_remote(sd) else roots[1],
+        )
+        if android and not inferred:
+            inferred = walkman_mod.KIND_ANDROID
+        created, changed = walkman_mod.bind_live_device(
+            _SETTINGS, internal, sd, inferred_kind=inferred)
+        self.apply_device_profile(_SETTINGS)
+        if created:
+            self.new_walkman = self.device_name
+        self.pull_listen_credentials()
+        return changed or created
+
+    def pull_listen_credentials(self) -> dict[str, str]:
+        """Walkman `listen_sources.conf` wins; empty fields stay on the PC `.env`."""
+        applied = walkman_mod.apply_listen_credentials(self.internal_drive, self.sd_drive)
+        self.lastfm_api_key = os.environ.get("LASTFM_API_KEY", "") or self.lastfm_api_key
+        self.lastfm_api_secret = os.environ.get("LASTFM_API_SECRET", "") or self.lastfm_api_secret
+        self.lastfm_username = os.environ.get("LASTFM_USERNAME", "") or self.lastfm_username
+        self.lastfm_session_key = os.environ.get("LASTFM_SESSION_KEY", "") or self.lastfm_session_key
+        self.audiomuse_url = os.environ.get("AUDIOMUSE_URL", "") or self.audiomuse_url
+        self.audiomuse_token = os.environ.get("AUDIOMUSE_TOKEN", "") or self.audiomuse_token
+        return applied
+
+    @property
+    def dest_drive(self) -> str:
+        return walkman_mod.pick_dest(self.dest, self.internal_drive, self.sd_drive)
+
+    @property
+    def other_drive(self) -> str:
+        dest = self.dest_drive
+        return self.sd_drive if os.path.normcase(dest) == os.path.normcase(self.internal_drive) else self.internal_drive
+
+    def dest_is_internal(self) -> bool:
+        return os.path.normcase(self.dest_drive) == os.path.normcase(self.internal_drive)
 
     @property
     def internal_max_bytes(self) -> int:
-        return int(self.internal_max_gb * 1024 * 1024 * 1024)
+        return self._cap_bytes(self.internal_drive, self.internal_max_gb)
 
     @property
     def internal_music_budget_bytes(self) -> int:
-        usable_gb = max(self.internal_max_gb - self.internal_safety_buffer_gb, 0)
-        return int(usable_gb * 1024 * 1024 * 1024)
+        if self.internal_max_gb > 0:
+            usable_gb = max(self.internal_max_gb - self.internal_safety_buffer_gb, 0)
+            return int(usable_gb * 1024 * 1024 * 1024)
+        return walkman_mod.live_budget_bytes(self.internal_drive)
 
     @property
     def sd_max_bytes(self) -> int:
-        return int(self.sd_max_gb * 1024 * 1024 * 1024)
+        return self._cap_bytes(self.sd_drive, self.sd_max_gb)
+
+    def dest_budget_bytes(self, held_bytes: int = 0) -> int:
+        if self.dest_is_internal():
+            if self.internal_max_gb > 0:
+                return self.internal_music_budget_bytes
+        elif self.sd_max_gb > 0:
+            return self.sd_max_bytes
+        return walkman_mod.live_budget_bytes(self.dest_drive, held_bytes)
+
+    def _cap_bytes(self, path: str, max_gb: float) -> int:
+        if max_gb > 0:
+            return int(max_gb * 1024 * 1024 * 1024)
+        total = walkman_mod.live_total_bytes(path)
+        return total if total else 0
 
     @property
     def excluded_album_entries(self) -> list[str]:
         return parse_album_exclusion_entries(self.excluded_albums)
+
+    def persist(self) -> None:
+        source_dir = self.source_dir
+        playlist_dir = self.playlist_dir
+        saved_source = _SETTINGS.source_dir
+        saved_playlists = _SETTINGS.playlist_dir
+        if saved_source and os.path.normcase(walkman_mod.resolve_library_path(saved_source)) == os.path.normcase(source_dir):
+            source_dir = saved_source
+        if saved_playlists and os.path.normcase(walkman_mod.resolve_library_path(saved_playlists)) == os.path.normcase(playlist_dir):
+            playlist_dir = saved_playlists
+        settings = _SETTINGS
+        settings.source_dir = source_dir
+        settings.playlist_dir = playlist_dir
+        settings.excluded_albums = self.excluded_albums
+        settings.copy_workers = self.copy_workers
+        settings.auto_detect_drives = self.auto_detect_drives
+        if self.active_device and self.active_device in settings.devices:
+            settings.active_device = self.active_device
+        profile = settings.ensure_active_profile()
+        profile.name = self.device_name or profile.name
+        profile.internal_drive = self.internal_drive
+        profile.sd_drive = self.sd_drive
+        profile.dest = self.dest if self.dest in (
+            walkman_mod.DEST_INTERNAL, walkman_mod.DEST_SD, walkman_mod.DEST_AUTO
+        ) else walkman_mod.DEST_AUTO
+        profile.device_kind = self.device_kind if self.device_kind in walkman_mod.DEVICE_KINDS \
+            else walkman_mod.KIND_CINDER
+        profile.internal_max_gb = self.internal_max_gb
+        profile.sd_max_gb = self.sd_max_gb
+        if self.internal_drive:
+            serial = walkman_mod.get_volume_serial(self.internal_drive)
+            if serial:
+                profile.internal_serial = serial
+        if self.sd_drive:
+            serial = walkman_mod.get_volume_serial(self.sd_drive)
+            if serial:
+                profile.sd_serial = serial
+        if profile.primary_serial and settings.active_device == walkman_mod.PENDING_DEVICE_ID:
+            settings.devices[profile.primary_serial] = settings.devices.pop(
+                walkman_mod.PENDING_DEVICE_ID)
+            settings.active_device = profile.primary_serial
+            self.active_device = profile.primary_serial
+        settings.save()
+        try:
+            save_env_value("SYNC_EXCLUDED_ALBUMS", self.excluded_albums)
+            save_env_value("SYNC_COPY_WORKERS", str(self.copy_workers))
+        except OSError:
+            pass
 
 
 @dataclass
@@ -238,6 +357,11 @@ class FileEntry:
     rel_path: str
     size: int
     mtime: float
+    content_key: str = ""
+    artist: str = ""
+    title: str = ""
+    album: str = ""
+    track_no: int = 0
 
 
 @dataclass
@@ -245,8 +369,34 @@ class DeviceScan:
     """Single-pass snapshot of a destination drive (built once, reused everywhere)."""
     root: str
     artist_files: dict[str, list[str]] = field(default_factory=dict)   # artist folder -> [rel_path]
-    files: dict[str, tuple[int, float]] = field(default_factory=dict)  # rel_path -> (size, mtime)
+    files: dict[str, tuple[int, float]] = field(default_factory=dict)  # original rel -> (size, mtime)
+    by_case: dict[str, str] = field(default_factory=dict)              # normcase rel -> original rel
     playlists: set[str] = field(default_factory=set)
+    partials: list[str] = field(default_factory=list)
+    content_keys: dict[str, str] = field(default_factory=dict)  # normcase rel -> key
+
+    def add_file(self, rel: str, size: int, mtime: float, content_key: str = "") -> None:
+        self.files[rel] = (size, mtime)
+        self.by_case[os.path.normcase(rel)] = rel
+        if content_key:
+            self.content_keys[os.path.normcase(rel)] = content_key
+
+    def rel_for_key(self, key: str) -> str | None:
+        if not key:
+            return None
+        for folded, stored in self.content_keys.items():
+            if stored == key:
+                return self.by_case.get(folded, folded)
+        return None
+
+    def lookup(self, rel: str) -> tuple[int, float] | None:
+        original = self.by_case.get(os.path.normcase(rel))
+        if original is None:
+            return None
+        return self.files.get(original)
+
+    def original_rel(self, rel: str) -> str | None:
+        return self.by_case.get(os.path.normcase(rel))
 
     @property
     def artist_folders(self) -> list[str]:
@@ -268,6 +418,10 @@ class CopyJob:
     dest_drive: str
     transfer_bytes: int   # full source size (throughput accounting)
     extra_bytes: int      # additional free space the copy consumes on the device
+    rel_path: str = ""
+    source_mtime: float = 0.0
+    content_key: str = ""
+    adopt_from: str = ""  # other-volume path to copy instead of SMB, if set
 
 
 @dataclass
@@ -312,6 +466,14 @@ class DriveSpaceProjection:
 
 
 @dataclass
+class DuplicateGroup:
+    kind: str          # "cross-drive" | "content-key" | "likes-key" | "device-only"
+    key: str
+    paths: list[str]
+    auto_fix: bool
+
+
+@dataclass
 class ScanReport:
     plan: LibraryPlan | None
     result: SyncResult
@@ -324,6 +486,8 @@ class ScanReport:
     space_projection: dict[str, DriveSpaceProjection] = field(default_factory=dict)
     device_scans: dict[str, DeviceScan] = field(default_factory=dict)
     source_total_bytes: int = 0
+    duplicate_groups: list[DuplicateGroup] = field(default_factory=list)
+    catalog_coverage: dict = field(default_factory=dict)
 
 
 PUNCT_TRANSLATION = str.maketrans({
@@ -415,24 +579,41 @@ class ScrobbleFile:
 
 
 class ProgressTracker:
-    def __init__(self, total: int, callback: ProgressCallback | None = None) -> None:
+    def __init__(
+        self,
+        total: int,
+        callback: ProgressCallback | None = None,
+        ui: object | None = None,
+    ) -> None:
         self.total = max(total, 1)
         self.current = 0
         self.callback = callback
+        self.ui = ui
         self.last_step_time: float | None = None
         self.recent_step_seconds: deque[float] = deque(maxlen=6)
         self.copy_phase_active = False
         self.copy_bytes_total = 0
         self.copy_bytes_done = 0
         self.recent_copy_samples: deque[tuple[float, int]] = deque(maxlen=6)
+        self.dest_label = ""
+        self._rate_window_start = 0.0
+        self._rate_window_bytes = 0
+        self._lock = threading.Lock()
 
-    def begin_copy_phase(self, total_bytes: int) -> None:
+    def begin_copy_phase(self, total_bytes: int, dest_label: str = "") -> None:
         self.copy_phase_active = True
         self.copy_bytes_total = max(total_bytes, 0)
         self.copy_bytes_done = 0
+        self.dest_label = dest_label
         self.recent_step_seconds.clear()
         self.recent_copy_samples.clear()
         self.last_step_time = time.monotonic()
+        self._rate_window_start = self.last_step_time
+        self._rate_window_bytes = 0
+        ui = self.ui
+        begin = getattr(ui, "begin_copy", None) if ui is not None else None
+        if callable(begin):
+            begin(dest_label, self.copy_bytes_total)
 
     def end_copy_phase(self) -> None:
         self.copy_phase_active = False
@@ -441,6 +622,10 @@ class ProgressTracker:
         self.recent_copy_samples.clear()
         self.recent_step_seconds.clear()
         self.last_step_time = time.monotonic()
+        ui = self.ui
+        end = getattr(ui, "end_copy", None) if ui is not None else None
+        if callable(end):
+            end()
 
     def estimate_generic_eta(self) -> float | None:
         if len(self.recent_step_seconds) < 3:
@@ -449,15 +634,59 @@ class ProgressTracker:
         remaining_steps = max(self.total - (self.current + 1), 0)
         return average_step * remaining_steps
 
-    def estimate_copy_eta(self) -> float | None:
+    def copy_rate(self) -> float | None:
         if len(self.recent_copy_samples) < 2:
             return None
         total_time = sum(sample_time for sample_time, _ in self.recent_copy_samples)
         total_bytes = sum(sample_bytes for _, sample_bytes in self.recent_copy_samples)
         if total_time <= 0 or total_bytes <= 0:
             return None
+        return total_bytes / total_time
+
+    def estimate_copy_eta(self) -> float | None:
+        rate = self.copy_rate()
+        if rate is None:
+            return None
         remaining_bytes = max(self.copy_bytes_total - self.copy_bytes_done, 0)
-        return remaining_bytes / (total_bytes / total_time)
+        return remaining_bytes / rate
+
+    def _push_callback(self, message: str) -> None:
+        eta_seconds = self.estimate_copy_eta() if self.copy_phase_active else None
+        if eta_seconds is None:
+            eta_seconds = self.estimate_generic_eta()
+        if self.callback:
+            current = self.copy_bytes_done if self.copy_phase_active else self.current
+            total = self.copy_bytes_total if self.copy_phase_active else self.total
+            self.callback(current, max(total, 1), message, eta_seconds)
+        ui = self.ui
+        report = getattr(ui, "report_copy", None) if ui is not None else None
+        if callable(report) and self.copy_phase_active:
+            report(self.copy_bytes_done, self.copy_bytes_total, self.copy_rate(), self.dest_label)
+
+    def add_copy_bytes(self, nbytes: int) -> None:
+        if nbytes <= 0:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self.copy_bytes_done += nbytes
+            self._rate_window_bytes += nbytes
+            elapsed = now - self._rate_window_start
+            if elapsed >= 0.25:
+                self.recent_copy_samples.append((elapsed, self._rate_window_bytes))
+                self._rate_window_start = now
+                self._rate_window_bytes = 0
+
+    def set_worker(self, slot_id: str, label: str, filename: str, done: int, total: int) -> None:
+        ui = self.ui
+        setter = getattr(ui, "set_worker", None) if ui is not None else None
+        if callable(setter):
+            setter(slot_id, label, filename, done, total)
+
+    def clear_worker(self, slot_id: str) -> None:
+        ui = self.ui
+        clearer = getattr(ui, "clear_worker", None) if ui is not None else None
+        if callable(clearer):
+            clearer(slot_id)
 
     def step(self, message: str, bytes_processed: int | None = None) -> None:
         now = time.monotonic()
@@ -467,14 +696,9 @@ class ProgressTracker:
             if self.copy_phase_active and bytes_processed and bytes_processed > 0:
                 self.recent_copy_samples.append((step_duration, bytes_processed))
                 self.copy_bytes_done += bytes_processed
-
-        eta_seconds = self.estimate_copy_eta() if self.copy_phase_active else None
-        if eta_seconds is None:
-            eta_seconds = self.estimate_generic_eta()
         self.last_step_time = now
         self.current += 1
-        if self.callback:
-            self.callback(self.current, self.total, message, eta_seconds)
+        self._push_callback(message)
 
 
 @dataclass
@@ -542,6 +766,21 @@ def scan_source_folders(source_dir: str, folders: list[str] | set[str]) -> dict[
     }
 
 
+def _is_preserved_name(name: str) -> bool:
+    lower = name.lower()
+    if lower in CINDER_PRESERVE_NAMES or lower in MANAGED_PLAYLISTS:
+        return True
+    if lower.startswith(CINDER_PRESERVE_PREFIXES):
+        return True
+    if lower == CINDER_PLAYLISTS_DIR or lower == "cinder_palettes":
+        return True
+    return False
+
+
+def _is_partial_name(name: str) -> bool:
+    return name.startswith(".") and name.endswith(manifest_mod.PARTIAL_SUFFIX)
+
+
 def scan_device(drive_root: str) -> DeviceScan:
     """One scandir pass over a destination drive: artist files (+size/mtime) and playlists."""
     scan = DeviceScan(root=drive_root)
@@ -556,16 +795,210 @@ def scan_device(drive_root: str) -> DeviceScan:
     for entry in top_entries:
         try:
             if entry.is_dir(follow_symlinks=False):
+                if _is_preserved_name(entry.name):
+                    continue
                 folder_entries = _scan_tree(entry.path, drive_root)
-                scan.artist_files[entry.name] = [fe.rel_path for fe in folder_entries]
+                rels: list[str] = []
                 for fe in folder_entries:
-                    scan.files[fe.rel_path] = (fe.size, fe.mtime)
-            elif entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(PLAYLIST_EXT):
-                if entry.name.lower() not in MANAGED_PLAYLISTS:
-                    scan.playlists.add(entry.name)
+                    name = os.path.basename(fe.rel_path)
+                    if _is_partial_name(name):
+                        scan.partials.append(fe.rel_path)
+                        continue
+                    if name.lower() == manifest_mod.MANIFEST_NAME:
+                        continue
+                    scan.add_file(fe.rel_path, fe.size, fe.mtime)
+                    rels.append(fe.rel_path)
+                scan.artist_files[entry.name] = rels
+            elif entry.is_file(follow_symlinks=False):
+                if _is_partial_name(entry.name):
+                    scan.partials.append(entry.name)
+                    continue
+                if _is_preserved_name(entry.name):
+                    continue
+                if entry.name.lower().endswith(PLAYLIST_EXT):
+                    if entry.name.lower() not in MANAGED_PLAYLISTS:
+                        scan.playlists.add(entry.name)
         except OSError:
             continue
     return scan
+
+
+def dest_kind_for(config: AppConfig, drive: str) -> str:
+    if drive and os.path.normcase(drive) == os.path.normcase(config.internal_drive):
+        return catalog_mod.KIND_INTERNAL
+    return catalog_mod.KIND_SD
+
+
+def _guard_device_scans(
+    config: AppConfig,
+    cat: catalog_mod.Catalog,
+    device_scans: dict[str, DeviceScan],
+    result: SyncResult | None = None,
+) -> dict[str, DeviceScan]:
+    """Drop scans for volumes that are unplugged or no longer the catalogued disk."""
+    guarded: dict[str, DeviceScan] = {}
+    for path, kind in (
+        (config.internal_drive, catalog_mod.KIND_INTERNAL),
+        (config.sd_drive, catalog_mod.KIND_SD),
+    ):
+        scan = device_scans.get(path) or DeviceScan(root=path)
+        if not path:
+            guarded[path] = scan
+            continue
+        ok, reason = cat.confirm_live(kind, path)
+        if not ok:
+            if result is not None and reason and "not connected" not in reason:
+                result.log(reason)
+            guarded[path] = DeviceScan(root=path)
+            continue
+        guarded[path] = scan
+    return guarded
+
+
+def require_live_dest(
+    config: AppConfig,
+    cat: catalog_mod.Catalog | None,
+    result: SyncResult,
+) -> bool:
+    dest = config.dest_drive
+    if not dest:
+        result.log("No destination set.")
+        return False
+    if cat is None:
+        if not storage_mod.isdir(dest):
+            result.log("Walkman not connected.")
+            return False
+        return True
+    ok, reason = cat.confirm_live(dest_kind_for(config, dest), dest)
+    if not ok:
+        result.log(reason)
+        return False
+    return True
+
+
+def _catalog_progress(status: Callable[[str], None] | None, label: str):
+    def progress(folder: str, index: int, total: int) -> None:
+        if status:
+            status(f"{label}: {folder}  {index}/{total}")
+    return progress
+
+
+def refresh_catalog(
+    config: AppConfig,
+    status: Callable[[str], None] | None = None,
+    *,
+    source: bool = True,
+    dest: bool = True,
+    catalog: catalog_mod.Catalog | None = None,
+) -> catalog_mod.Catalog:
+    """Incrementally update the PC catalog. Missing dest roots are skipped (Walkman unplugged)."""
+    cat = catalog or catalog_mod.Catalog()
+
+    def note(message: str) -> None:
+        if status:
+            status(message)
+
+    if dest:
+        for label, root, kind in (
+            ("internal", config.internal_drive, catalog_mod.KIND_INTERNAL),
+            ("sd", config.sd_drive, catalog_mod.KIND_SD),
+        ):
+            ok, reason = cat.confirm_live(kind, root) if root else (False, "")
+            if not ok:
+                if root and reason:
+                    note(f"{label}: {reason}")
+                continue
+            note(f"Indexing Walkman {label}...")
+            cat.refresh_dest(root, kind, _catalog_progress(status, label))
+    if source and config.source_dir and os.path.isdir(config.source_dir):
+        note("Indexing library...")
+        cat.refresh_source(config.source_dir, _catalog_progress(status, "library"))
+    return cat
+
+
+def device_scan_from_catalog(
+    cat: catalog_mod.Catalog, kind: str, root: str,
+) -> DeviceScan:
+    scan = DeviceScan(root=root)
+    if not root:
+        return scan
+    for row in cat.files_for(kind, root):
+        name = os.path.basename(row.rel)
+        if _is_partial_name(name):
+            scan.partials.append(row.rel)
+            continue
+        parts = Path(row.rel).parts
+        if len(parts) == 1:
+            lower = name.lower()
+            if lower.endswith(PLAYLIST_EXT) and lower not in MANAGED_PLAYLISTS and not _is_preserved_name(name):
+                scan.playlists.add(name)
+            continue
+        scan.add_file(row.rel, row.size, row.mtime, row.content_key)
+        scan.artist_files.setdefault(parts[0], []).append(row.rel)
+    return scan
+
+
+def source_files_from_catalog(
+    cat: catalog_mod.Catalog, source_dir: str, folders: set[str] | list[str],
+) -> dict[str, list[FileEntry]]:
+    grouped: dict[str, list[FileEntry]] = {folder: [] for folder in folders}
+    fold_map = {os.path.normcase(folder): folder for folder in folders}
+    for row in cat.files_for(catalog_mod.KIND_SOURCE, source_dir):
+        parts = Path(row.rel).parts
+        if not parts:
+            continue
+        folder = fold_map.get(os.path.normcase(parts[0]))
+        if folder is None:
+            continue
+        grouped[folder].append(FileEntry(
+            row.rel, row.size, row.mtime,
+            content_key=row.content_key, artist=row.artist, title=row.title,
+            album=row.album, track_no=row.track_no,
+        ))
+    return grouped
+
+
+def index_library(
+    config: AppConfig,
+    status: Callable[[str], None] | None = None,
+) -> SyncResult:
+    result = SyncResult()
+    if not config.source_dir or not os.path.isdir(config.source_dir):
+        result.log(f"Source directory does not exist: {config.source_dir}")
+        return result
+    with catalog_mod.Catalog() as cat:
+        stats = cat.refresh_source(config.source_dir, _catalog_progress(status, "library"))
+    result.log(
+        f"Library index: +{stats.added} updated {stats.updated} "
+        f"unchanged {stats.unchanged} removed {stats.removed} keyed {stats.keyed}"
+    )
+    return result
+
+
+def index_walkman(
+    config: AppConfig,
+    status: Callable[[str], None] | None = None,
+) -> SyncResult:
+    result = SyncResult()
+    mounted = False
+    with catalog_mod.Catalog() as cat:
+        for label, root, kind in (
+            ("internal", config.internal_drive, catalog_mod.KIND_INTERNAL),
+            ("sd", config.sd_drive, catalog_mod.KIND_SD),
+        ):
+            ok, reason = cat.confirm_live(kind, root) if root else (False, "unplugged")
+            if not ok:
+                result.log(f"{label}: {reason or 'unplugged'}")
+                continue
+            mounted = True
+            stats = cat.refresh_dest(root, kind, _catalog_progress(status, label))
+            result.log(
+                f"{label} index: +{stats.added} updated {stats.updated} "
+                f"unchanged {stats.unchanged} removed {stats.removed} keyed {stats.keyed}"
+            )
+    if not mounted:
+        result.log("Walkman not connected — plug it in and try again.")
+    return result
 
 
 def get_dir_size(path: str | Path) -> int:
@@ -608,26 +1041,21 @@ def get_device_root(path: str) -> Path:
 
 
 def is_path_within_root(path: str | Path, root: str | Path) -> bool:
-    try:
-        path_resolved = Path(path).resolve(strict=False)
-        root_resolved = Path(root).resolve(strict=False)
-    except OSError:
-        return False
-    return path_resolved.is_relative_to(root_resolved)
+    return storage_mod.within(str(path), str(root))
 
 
 def get_free_bytes(path: str) -> int:
-    for candidate in (path, str(get_device_root(path))):
-        try:
-            return shutil.disk_usage(candidate).free
-        except OSError:
-            continue
-    raise OSError(f"Could not determine free space for destination: {path}")
+    usage = storage_mod.disk_usage(path)
+    if usage is not None:
+        return usage[1]
+    return walkman_mod.live_free_bytes(path)
 
 
 def build_scrobble_targets(config: AppConfig) -> list[tuple[str, Path]]:
     targets: list[tuple[str, Path]] = []
     seen: set[str] = set()
+    if config.is_android:
+        return targets
 
     for label, music_path in (("internal", config.internal_drive), ("sd", config.sd_drive)):
         music_root = Path(music_path)
@@ -853,6 +1281,7 @@ def list_artist_folders(path: str) -> list[str]:
     return sorted(
         name for name in os.listdir(path)
         if os.path.isdir(os.path.join(path, name))
+        and not _is_preserved_name(name)
     )
 
 
@@ -1063,65 +1492,19 @@ def build_folder_groups(
     return groups
 
 
-def choose_drive_for_group(
-    group: FolderGroup,
-    internal_used: int,
-    sd_used: int,
-    config: AppConfig,
-    preferred_drive: str | None = None,
-) -> str | None:
-    fits_internal = internal_used + group.size_bytes <= config.internal_music_budget_bytes
-    fits_sd = sd_used + group.size_bytes <= config.sd_max_bytes
-
-    if preferred_drive == config.internal_drive and fits_internal:
-        return config.internal_drive
-    if preferred_drive == config.sd_drive and fits_sd:
-        return config.sd_drive
-
-    if fits_internal and fits_sd:
-        internal_free_after = config.internal_music_budget_bytes - (internal_used + group.size_bytes)
-        sd_free_after = config.sd_max_bytes - (sd_used + group.size_bytes)
-        return config.internal_drive if internal_free_after >= sd_free_after else config.sd_drive
-    if fits_internal:
-        return config.internal_drive
-    if fits_sd:
-        return config.sd_drive
-    return None
-
-
-def preferred_drive_for_group(
-    group: FolderGroup,
-    device_scans: dict[str, DeviceScan] | None,
-    config: AppConfig,
-) -> str | None:
+def dest_held_bytes(config: AppConfig, device_scans: dict[str, DeviceScan] | None) -> int:
     if not device_scans:
-        return None
-
-    scores: dict[str, tuple[int, int]] = {}
-    for drive in (config.internal_drive, config.sd_drive):
-        scan = device_scans.get(drive)
-        if scan is None:
-            continue
-        folder_count = 0
-        byte_count = 0
-        for folder in group.folders:
-            rel_files = scan.artist_files.get(folder)
-            if not rel_files:
-                continue
-            folder_count += 1
-            byte_count += sum(scan.files[rel][0] for rel in rel_files if rel in scan.files)
-        if folder_count:
-            scores[drive] = (folder_count, byte_count)
-
-    if not scores:
-        return None
-    return max(scores, key=lambda drive: scores[drive])
+        return 0
+    scan = device_scans.get(config.dest_drive)
+    return scan.total_size if scan is not None else 0
 
 
 def build_library_plan(
     config: AppConfig,
     result: SyncResult,
     device_scans: dict[str, DeviceScan] | None = None,
+    source_files: dict[str, list[FileEntry]] | None = None,
+    catalog: catalog_mod.Catalog | None = None,
 ) -> LibraryPlan | None:
     source_path = Path(config.source_dir)
     playlist_path = Path(config.playlist_dir)
@@ -1139,7 +1522,14 @@ def build_library_plan(
     if excluded_folders:
         result.artists_excluded = len(excluded_folders)
         source_artists -= excluded_folders
-    source_files = scan_source_folders(config.source_dir, source_artists)
+    if source_files is None and catalog is not None:
+        source_files = source_files_from_catalog(catalog, config.source_dir, source_artists)
+        if source_artists and not any(source_files.values()):
+            source_files = None
+    if source_files is None:
+        source_files = scan_source_folders(config.source_dir, source_artists)
+    else:
+        source_files = {folder: list(source_files.get(folder, [])) for folder in source_artists}
     folder_sizes = {
         folder: sum(entry.size for entry in entries)
         for folder, entries in source_files.items()
@@ -1179,6 +1569,12 @@ def build_library_plan(
 
     groups = build_folder_groups(folder_sizes, playlist_folders)
 
+    dest_drive = config.dest_drive
+    dest_label = drive_label(dest_drive, config)
+    held = dest_held_bytes(config, device_scans)
+    budget = config.dest_budget_bytes(held)
+    result.log(f"Destination: {dest_label} ({dest_drive}), budget {human_size(budget)}")
+
     assignments: dict[str, str] = {}
     file_locations: dict[str, str] = {}
     desired_files_by_drive = {
@@ -1192,33 +1588,25 @@ def build_library_plan(
     playlist_entries: dict[str, list[str]] = {}
     playlist_drive: dict[str, str] = {}
 
-    internal_used = 0
-    sd_used = 0
-
+    used = 0
     for group in groups:
-        preferred_drive = preferred_drive_for_group(group, device_scans, config)
-        dest_drive = choose_drive_for_group(group, internal_used, sd_used, config, preferred_drive)
-        if dest_drive is None:
+        if used + group.size_bytes > budget:
             result.artists_skipped += len(group.folders)
             result.log(
                 "Skipping group "
                 f"{', '.join(sorted(group.folders))}: {human_size(group.size_bytes)} exceeds"
-                " remaining internal and SD capacity."
+                f" remaining {dest_label} capacity."
             )
             continue
-
-        if dest_drive == config.internal_drive:
-            internal_used += group.size_bytes
-        else:
-            sd_used += group.size_bytes
+        used += group.size_bytes
 
         for folder in sorted(group.folders, key=str.lower):
             assignments[folder] = dest_drive
-            if dest_drive == config.internal_drive:
+            if config.dest_is_internal():
                 result.artists_internal += 1
             else:
                 result.artists_sd += 1
-            result.log(f"{folder} -> {dest_drive} ({human_size(folder_sizes[folder])})")
+            result.log(f"{folder} -> {dest_label} ({human_size(folder_sizes[folder])})")
 
             for entry in source_files.get(folder, []):
                 rel_path = entry.rel_path
@@ -1230,7 +1618,7 @@ def build_library_plan(
             track_lines = [
                 track
                 for track in playlist_tracks.get(playlist_name, [])
-                if track in file_locations and file_locations[track] == dest_drive
+                if track in file_locations
             ]
             if not track_lines:
                 continue
@@ -1258,35 +1646,87 @@ def build_copy_jobs(
     config: AppConfig,
     plan: LibraryPlan,
     device_scans: dict[str, DeviceScan],
+    dest_manifest: manifest_mod.Manifest | None = None,
+    other_manifest: manifest_mod.Manifest | None = None,
+    key_cache: contentkey_mod.KeyCache | None = None,
 ) -> list[CopyJob]:
     """Decide what to copy using cached source + device metadata — no per-file stat()."""
+    dest_drive = config.dest_drive
+    other_drive = config.other_drive
+    dest_scan = device_scans.get(dest_drive) or DeviceScan(root=dest_drive)
+    other_scan = device_scans.get(other_drive) or DeviceScan(root=other_drive)
+    dest_manifest = dest_manifest or manifest_mod.Manifest()
+    other_manifest = other_manifest or manifest_mod.Manifest()
+    key_cache = key_cache or contentkey_mod.KeyCache()
     jobs: list[CopyJob] = []
-    for artist_folder, dest_drive in plan.assignments.items():
-        device = device_scans.get(dest_drive)
-        existing = device.files if device else {}
+    for artist_folder, assigned in plan.assignments.items():
+        if os.path.normcase(assigned) != os.path.normcase(dest_drive):
+            continue
         for entry in plan.source_files.get(artist_folder, []):
             rel = entry.rel_path
-            current = existing.get(rel)
-            if current is None:
-                extra_bytes = entry.size
-            else:
-                dst_size, dst_mtime = current
-                # Up-to-date when the size matches and the source is not genuinely newer.
-                # The tolerance absorbs exFAT/FAT's 2-second timestamp granularity, so an
-                # unchanged file is never recopied just because the device rounded its
-                # mtime down when it was first written. A size mismatch always recopies.
+            src = os.path.join(config.source_dir, rel)
+            suffix = Path(rel).suffix.lower()
+            source_key = entry.content_key or None
+            if not source_key and suffix in (".flac", ".mp3"):
+                source_key = key_cache.resolve(src, entry.size, entry.mtime)
+            dest_meta = dest_scan.lookup(rel)
+            dest_size = dest_meta[0] if dest_meta else None
+            dest_key = dest_scan.content_keys.get(os.path.normcase(rel), "")
+            if not dest_key:
+                dest_record = dest_manifest.lookup(rel)
+                dest_key = dest_record.content_key if dest_record else ""
+            if dest_manifest.up_to_date(rel, entry.size, entry.mtime, dest_size, source_key):
+                continue
+            if dest_meta is not None:
+                dst_size, dst_mtime = dest_meta
+                if source_key and dest_key == source_key:
+                    continue
+                if (source_key and dest_manifest.lookup(rel)
+                        and dest_manifest.lookup(rel).content_key == source_key):
+                    continue
                 if entry.size == dst_size and entry.mtime <= dst_mtime + MTIME_TOLERANCE_SECONDS:
                     continue
-                extra_bytes = max(entry.size - dst_size, 0)
+            extra_bytes = entry.size if dest_size is None else max(entry.size - dest_size, 0)
+            adopt_from = ""
+            if dest_meta is None and source_key:
+                dest_held_rel = dest_scan.rel_for_key(source_key) or dest_manifest.rel_for_key(source_key)
+                if dest_held_rel and dest_scan.lookup(dest_held_rel):
+                    adopt_from = storage_mod.join(dest_drive, dest_held_rel)
+                    extra_bytes = 0
+            if not adopt_from:
+                other_meta = other_scan.lookup(rel)
+                if dest_meta is None and other_meta is not None:
+                    other_rel = other_scan.original_rel(rel) or rel
+                    other_record = other_manifest.lookup(other_rel)
+                    other_key = other_scan.content_keys.get(os.path.normcase(other_rel), "")
+                    if not other_key and other_record:
+                        other_key = other_record.content_key
+                    if (source_key and other_key == source_key) or (
+                        other_meta[0] == entry.size
+                        and entry.mtime <= other_meta[1] + MTIME_TOLERANCE_SECONDS
+                    ):
+                        adopt_from = storage_mod.join(other_drive, other_rel)
+                elif dest_meta is None and source_key:
+                    other_rel = other_scan.rel_for_key(source_key) or other_manifest.rel_for_key(source_key)
+                    if other_rel and other_scan.lookup(other_rel):
+                        adopt_from = storage_mod.join(other_drive, other_rel)
             jobs.append(
                 CopyJob(
-                    src=os.path.join(config.source_dir, rel),
-                    dst=os.path.join(dest_drive, rel),
+                    src=src,
+                    dst=storage_mod.join(dest_drive, rel),
                     dest_drive=dest_drive,
                     transfer_bytes=entry.size,
                     extra_bytes=extra_bytes,
+                    rel_path=rel,
+                    source_mtime=entry.mtime,
+                    content_key=source_key or "",
+                    adopt_from=adopt_from,
                 )
             )
+    try:
+        key_cache.save()
+    except OSError:
+        pass
     return jobs
 
 
@@ -1311,47 +1751,139 @@ def calculate_pending_copy_budgets(
     return budgets_from_jobs(config, build_copy_jobs(config, plan, device_scans))
 
 
+def _album_batches(jobs: list[CopyJob]) -> list[list[CopyJob]]:
+    grouped: dict[str, list[CopyJob]] = {}
+    order: list[str] = []
+    for job in jobs:
+        folder = Path(job.rel_path or job.src).parts[0] if (job.rel_path or job.src) else ""
+        if folder not in grouped:
+            order.append(folder)
+            grouped[folder] = []
+        grouped[folder].append(job)
+    return [grouped[name] for name in order]
+
+
 def _execute_copies(
     jobs: list[CopyJob],
     result: SyncResult,
     dry_run: bool,
     progress: ProgressTracker | None,
+    dest_manifest: manifest_mod.Manifest | None = None,
+    dest_label: str = "",
+    workers: int = 1,
+    catalog: catalog_mod.Catalog | None = None,
+    dest_kind: str = "",
 ) -> None:
-    """Copy planned files, in parallel when writing for real (I/O-bound on USB)."""
+    """Copy planned files onto the dest LUN only, album-batched, atomic."""
     if not jobs:
         return
+    dest_manifest = dest_manifest or manifest_mod.Manifest()
+    label = dest_label or "dest"
+    worker_count = max(workers, 1)
 
-    def record(job: CopyJob) -> None:
+    def record(job: CopyJob, copied: int | None = None) -> None:
         result.files_copied += 1
-        result.log(f"Copying: {os.path.basename(job.src)}")
+        source = "adopt" if job.adopt_from else "copy"
+        result.log(f"{source}: {os.path.basename(job.src)}")
         if progress:
-            progress.step(f"Syncing {os.path.basename(job.src)}", bytes_processed=job.transfer_bytes or None)
+            if copied is None:
+                progress.step(f"Syncing {os.path.basename(job.src)}",
+                              bytes_processed=job.transfer_bytes or None)
+            else:
+                progress.step(f"Syncing {os.path.basename(job.src)}")
 
     if dry_run:
         for job in jobs:
             record(job)
         return
 
-    # Create every destination directory once up front. Doing it here instead of inside
-    # each worker removes thousands of redundant makedirs() round-trips to the USB device.
-    for directory in sorted({os.path.dirname(job.dst) for job in jobs}):
-        os.makedirs(directory, exist_ok=True)
+    for directory in sorted({storage_mod.parent(job.dst) for job in jobs}):
+        if directory:
+            storage_mod.makedirs(directory)
 
     lock = threading.Lock()
     errors: list[tuple[CopyJob, OSError]] = []
+    unsaved = 0
+    dest_root = jobs[0].dest_drive
 
-    def worker(job: CopyJob) -> None:
+    def copy_one(job: CopyJob, slot_id: str) -> None:
+        nonlocal unsaved
+        src = job.adopt_from or job.src
+        filename = os.path.basename(job.src)
         try:
-            shutil.copy2(job.src, job.dst)
+            if progress:
+                progress.set_worker(slot_id, label, filename, 0, job.transfer_bytes)
+
+            def on_bytes(chunk: int, done: int, total: int) -> None:
+                if progress:
+                    progress.add_copy_bytes(chunk)
+                    progress.set_worker(slot_id, label, filename, done, total)
+                    progress._push_callback(f"{label}  {filename}")
+
+            copied = _transfer_job(job, src, on_bytes)
         except OSError as exc:
             with lock:
                 errors.append((job, exc))
             return
         with lock:
-            record(job)
+            dest_manifest.remember(
+                job.rel_path or os.path.basename(job.dst),
+                job.transfer_bytes,
+                job.source_mtime,
+                copied,
+                job.content_key,
+            )
+            if catalog is not None and dest_kind:
+                catalog.upsert_dest_file(
+                    dest_kind, dest_root,
+                    job.rel_path or os.path.basename(job.dst),
+                    copied, job.source_mtime, job.content_key,
+                )
+            if job.adopt_from and is_path_within_root(job.adopt_from, job.dest_drive):
+                old_rel = os.path.normpath(os.path.relpath(job.adopt_from, job.dest_drive))
+                if os.path.normcase(old_rel) != os.path.normcase(job.rel_path or ""):
+                    dest_manifest.forget(old_rel)
+                    if catalog is not None and dest_kind:
+                        catalog.forget_dest_file(dest_kind, dest_root, old_rel)
+            record(job, copied=copied)
+            unsaved += 1
+            if unsaved >= MANIFEST_SAVE_EVERY:
+                try:
+                    dest_manifest.save(dest_root)
+                except OSError:
+                    pass
+                unsaved = 0
+        if progress:
+            progress.clear_worker(slot_id)
 
-    with ThreadPoolExecutor(max_workers=COPY_WORKERS) as executor:
-        list(executor.map(worker, jobs))
+    if worker_count == 1:
+        for batch in _album_batches(jobs):
+            for job in batch:
+                copy_one(job, "dest")
+                if errors:
+                    break
+            if errors:
+                break
+    else:
+        # Opt-in extra writers, still dest-LUN only, album batches kept together.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            index = 0
+            for batch in _album_batches(jobs):
+                futs = []
+                for job in batch:
+                    slot = f"dest-{index % worker_count}"
+                    index += 1
+                    futs.append(pool.submit(copy_one, job, slot))
+                for fut in futs:
+                    fut.result()
+                if errors:
+                    break
+
+    try:
+        dest_manifest.save(dest_root)
+    except OSError:
+        pass
 
     if errors:
         job, exc = errors[0]
@@ -1362,6 +1894,25 @@ def _execute_copies(
                 "during the copy phase."
             ) from exc
         raise exc
+
+
+def _transfer_job(job: CopyJob, src: str, on_bytes) -> int:
+    """Rename on the dest LUN when adopting; otherwise atomic copy (SMB or other volume)."""
+    if (
+        job.adopt_from
+        and os.path.normcase(job.adopt_from) != os.path.normcase(job.dst)
+        and is_path_within_root(job.adopt_from, job.dest_drive)
+        and storage_mod.exists(job.adopt_from)
+    ):
+        parent_dir = storage_mod.parent(job.dst)
+        if parent_dir:
+            storage_mod.makedirs(parent_dir)
+        storage_mod.replace(job.adopt_from, job.dst)
+        size = job.transfer_bytes
+        if on_bytes:
+            on_bytes(size, size, size)
+        return size
+    return storage_mod.copy_file(src, job.dst, on_bytes)
 
 
 def ensure_copy_space_available(
@@ -1375,8 +1926,11 @@ def ensure_copy_space_available(
     if copy_budgets is None:
         copy_budgets = calculate_pending_copy_budgets(config, plan, device_scans or {})
 
+    dest = config.dest_drive
     for drive, budget in copy_budgets.items():
         if budget.files == 0:
+            continue
+        if os.path.normcase(drive) != os.path.normcase(dest):
             continue
 
         free_bytes = get_free_bytes(drive)
@@ -1520,17 +2074,18 @@ def build_scan_report(config: AppConfig, status: Callable[[str], None] | None = 
             status(message)
 
     result = SyncResult()
-    note("Scanning internal storage...")
-    internal_scan = scan_device(config.internal_drive)
-    note("Scanning SD card...")
-    sd_scan = scan_device(config.sd_drive)
-    device_scans = {
-        config.internal_drive: internal_scan,
-        config.sd_drive: sd_scan,
-    }
+    cat = refresh_catalog(config, status)
+    coverage = cat.coverage(config.internal_drive, config.sd_drive)
+    device_scans = _guard_device_scans(config, cat, {
+        config.internal_drive: device_scan_from_catalog(
+            cat, catalog_mod.KIND_INTERNAL, config.internal_drive),
+        config.sd_drive: device_scan_from_catalog(
+            cat, catalog_mod.KIND_SD, config.sd_drive),
+    }, result)
 
-    note("Scanning source library...")
-    plan = build_library_plan(config, result, device_scans=device_scans)
+    note("Planning from catalog...")
+    plan = build_library_plan(config, result, device_scans=device_scans, catalog=cat)
+    cat.close()
     if plan is None:
         return ScanReport(
             plan=None,
@@ -1539,13 +2094,17 @@ def build_scan_report(config: AppConfig, status: Callable[[str], None] | None = 
             stale_music_files=[],
             stale_playlists=[],
             device_scans=device_scans,
+            catalog_coverage=coverage,
         )
 
     note("Computing changes...")
-    duplicate_tracks = sorted(
-        internal_scan.audio_paths & sd_scan.audio_paths,
-        key=str.lower,
-    )
+    dest_manifest = manifest_mod.Manifest.load(config.dest_drive)
+    other_manifest = manifest_mod.Manifest.load(config.other_drive)
+    duplicate_groups = build_duplicate_groups(
+        config, plan, device_scans, dest_manifest, other_manifest)
+    duplicate_tracks = [
+        path for group in duplicate_groups if group.kind == "cross-drive" for path in group.paths
+    ]
     stale_music_files = iter_stale_music_files(config, plan, device_scans)
     stale_playlists = iter_stale_playlists(config, plan, device_scans)
     albums_to_add = count_albums_to_add(config, plan)
@@ -1565,19 +2124,78 @@ def build_scan_report(config: AppConfig, status: Callable[[str], None] | None = 
         space_projection=space_projection,
         device_scans=device_scans,
         source_total_bytes=sum(plan.folder_sizes.values()),
+        duplicate_groups=duplicate_groups,
+        catalog_coverage=coverage,
     )
 
 
-def write_playlist(path: str, lines: list[str], result: SyncResult, dry_run: bool) -> None:
-    result.playlists_written += 1
-    result.log(f"Writing playlist: {path}")
+def write_playlist(path: str, lines: list[str], result: SyncResult, dry_run: bool,
+                   counted: bool = True) -> None:
+    if counted:
+        result.playlists_written += 1
+        result.log(f"Writing playlist: {path}")
     if dry_run:
         return
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        for line in lines:
-            handle.write(line.replace("\\", "/") + "\n")
+    parent = storage_mod.parent(path)
+    if parent:
+        storage_mod.makedirs(parent)
+    storage_mod.write_text(path, "".join(line.replace("\\", "/") + "\n" for line in lines))
+
+
+def _player_volume_prefix(dest_drive: str, config: AppConfig) -> str:
+    if os.path.normcase(dest_drive) == os.path.normcase(config.sd_drive):
+        return "/contents_ext"
+    return "/contents"
+
+
+def _cinder_dir(music_path: str) -> str:
+    return os.path.join(walkman_mod.volume_root(music_path), CINDER_PLAYLISTS_DIR)
+
+
+def _cinder_playlist_lines(name: str, tracks: list[str], dest_drive: str, config: AppConfig) -> list[str]:
+    """PC-planned list for Cinder: paths as the player sees them, no #SYNC: / #CINDER-EDITED."""
+    stem = Path(name).stem
+    prefix = _player_volume_prefix(dest_drive, config) + "/MUSIC/"
+    return ["#EXTM3U", f"#PLAYLIST:{stem}"] + [
+        prefix + track.replace("\\", "/") for track in tracks
+    ]
+
+
+def pull_cinder_playlists(config: AppConfig, result: SyncResult, dry_run: bool) -> None:
+    """Copy #CINDER-EDITED lists off the dest volume into playlist_dir/from-walkman/."""
+    if not config.is_cinder:
+        return
+    roots = []
+    for drive in (config.dest_drive, config.internal_drive, config.sd_drive):
+        root = _cinder_dir(drive)
+        if root not in roots and os.path.isdir(root):
+            roots.append(root)
+    target_dir = os.path.join(config.playlist_dir, "from-walkman")
+    for folder in roots:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            if not name.lower().endswith(PLAYLIST_EXT):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                continue
+            if "#CINDER-EDITED:" not in text:
+                continue
+            cleaned = "\n".join(
+                line for line in text.splitlines() if not line.startswith("#CINDER-EDITED:")
+            ) + "\n"
+            dest = os.path.join(target_dir, name)
+            result.log(f"Pulling edited playlist {name} -> {dest}")
+            if dry_run:
+                continue
+            os.makedirs(target_dir, exist_ok=True)
+            Path(dest).write_text(cleaned, encoding="utf-8", newline="\n")
 
 
 def process_playlist(
@@ -1593,11 +2211,24 @@ def process_playlist(
 
     if dest_drive and track_lines:
         write_playlist(
-            os.path.join(dest_drive, playlist_name),
+            storage_mod.join(dest_drive, playlist_name),
             track_lines,
             result,
             dry_run,
         )
+        if config.is_cinder:
+            cinder_dir = _cinder_dir(dest_drive)
+            write_playlist(
+                storage_mod.join(
+                    cinder_dir,
+                    playlist_name if playlist_name.lower().endswith(".m3u8")
+                    else playlist_name + ".m3u8",
+                ),
+                _cinder_playlist_lines(playlist_name, track_lines, dest_drive, config),
+                result,
+                dry_run,
+                counted=False,
+            )
     else:
         result.skipped_entries += 1
         result.log(f"Skipping playlist with no assigned tracks: {playlist_name}")
@@ -1610,31 +2241,86 @@ def sync_library(
     config: AppConfig,
     dry_run: bool = False,
     progress_callback: ProgressCallback | None = None,
+    progress_ui: object | None = None,
+    device_scans: dict[str, DeviceScan] | None = None,
+    plan: LibraryPlan | None = None,
 ) -> SyncResult:
     result = SyncResult()
-    # One scan of each device up front, reused for stale detection and copy planning.
-    device_scans = {
-        config.internal_drive: scan_device(config.internal_drive),
-        config.sd_drive: scan_device(config.sd_drive),
-    }
-    plan = build_library_plan(config, result, device_scans=device_scans)
-    if plan is None:
-        return result
+    cat: catalog_mod.Catalog | None = None
+    if device_scans is None or plan is None:
+        cat = refresh_catalog(config)
+        if device_scans is None:
+            device_scans = {
+                config.internal_drive: device_scan_from_catalog(
+                    cat, catalog_mod.KIND_INTERNAL, config.internal_drive),
+                config.sd_drive: device_scan_from_catalog(
+                    cat, catalog_mod.KIND_SD, config.sd_drive),
+            }
+        device_scans = _guard_device_scans(config, cat, device_scans, result)
+        if not require_live_dest(config, cat, result):
+            cat.close()
+            return result
+        if plan is None:
+            plan = build_library_plan(
+                config, result, device_scans=device_scans, catalog=cat)
+        if plan is None:
+            if cat is not None:
+                cat.close()
+            return result
+    elif not dry_run:
+        cat = catalog_mod.Catalog()
+        device_scans = _guard_device_scans(config, cat, device_scans or {}, result)
+        if not require_live_dest(config, cat, result):
+            cat.close()
+            return result
 
-    copy_jobs = build_copy_jobs(config, plan, device_scans)
+    dest_manifest = manifest_mod.Manifest.load(config.dest_drive)
+    other_manifest = manifest_mod.Manifest.load(config.other_drive)
+    key_cache = contentkey_mod.KeyCache()
+    copy_jobs = build_copy_jobs(
+        config, plan, device_scans, dest_manifest, other_manifest, key_cache)
     copy_budgets = budgets_from_jobs(config, copy_jobs)
     total_copy_bytes = sum(job.transfer_bytes for job in copy_jobs)
 
     result.log("Scanning library...")
     stale_music_files = iter_stale_music_files(config, plan, device_scans)
     stale_playlists = iter_stale_playlists(config, plan, device_scans)
+    other_label = drive_label(config.other_drive, config)
+    dest_label = drive_label(config.dest_drive, config)
+    other_stale = [
+        path for path in stale_music_files
+        if is_path_within_root(path, config.other_drive)
+    ]
+    if other_stale:
+        result.log(f"{other_label} → {dest_label}: {len(other_stale)} file(s) will be removed from the unused volume.")
     progress = ProgressTracker(
         len(copy_jobs) + len(plan.playlist_names) + len(stale_music_files) + len(stale_playlists),
         progress_callback,
+        ui=progress_ui,
     )
 
-    result.log("Reconciling device state...")
-    for file_path in stale_music_files:
+    pull_cinder_playlists(config, result, dry_run)
+
+    dest = config.dest_drive
+    adopt_paths = {
+        os.path.normcase(job.adopt_from) for job in copy_jobs if job.adopt_from
+    }
+    dest_stale = [
+        path for path in stale_music_files
+        if is_path_within_root(path, dest) and os.path.normcase(path) not in adopt_paths
+    ]
+    leftover_stale = [
+        path for path in stale_music_files
+        if os.path.normcase(path) not in {os.path.normcase(p) for p in dest_stale}
+    ]
+
+    dest_kind = dest_kind_for(config, dest)
+    result.log("Reconciling dest volume...")
+    for file_path in dest_stale:
+        rel = storage_mod.relative(file_path, dest)
+        dest_manifest.forget(rel)
+        if cat is not None and not dry_run:
+            cat.forget_dest_file(dest_kind, dest, rel)
         remove_file(file_path, result, dry_run, playlist=False)
         progress.step(f"Removing {os.path.basename(file_path)}")
 
@@ -1643,19 +2329,54 @@ def sync_library(
         progress.step(f"Removing {os.path.basename(playlist_path)}")
 
     if not dry_run:
-        prune_after_removals(config, plan, stale_music_files)
+        prune_after_removals(config, plan, dest_stale)
         ensure_copy_space_available(config, plan, result, copy_budgets)
+        try:
+            dest_manifest.save(config.dest_drive)
+        except OSError:
+            pass
 
     result.log("Copying music...")
-    progress.begin_copy_phase(total_copy_bytes)
-    _execute_copies(copy_jobs, result, dry_run, progress)
+    progress.begin_copy_phase(total_copy_bytes, dest_label)
+    _execute_copies(
+        copy_jobs, result, dry_run, progress,
+        dest_manifest=dest_manifest,
+        dest_label=dest_label,
+        workers=config.copy_workers,
+        catalog=None if dry_run else cat,
+        dest_kind=dest_kind,
+    )
     progress.end_copy_phase()
+
+    if leftover_stale:
+        result.log(f"{other_label} → {dest_label}: removing leftover files from the unused volume.")
+        for file_path in leftover_stale:
+            if is_path_within_root(file_path, dest):
+                rel = storage_mod.relative(file_path, dest)
+                dest_manifest.forget(rel)
+                if cat is not None and not dry_run:
+                    cat.forget_dest_file(dest_kind, dest, rel)
+            elif cat is not None and not dry_run:
+                other = config.other_drive
+                if is_path_within_root(file_path, other):
+                    rel = storage_mod.relative(file_path, other)
+                    cat.forget_dest_file(dest_kind_for(config, other), other, rel)
+            remove_file(file_path, result, dry_run, playlist=False)
+            progress.step(f"Removing {os.path.basename(file_path)}")
+        if not dry_run:
+            prune_after_removals(config, plan, leftover_stale)
+            try:
+                dest_manifest.save(config.dest_drive)
+            except OSError:
+                pass
 
     result.log("Processing playlists...")
     for file_name in sorted(plan.playlist_names, key=str.lower):
         process_playlist(file_name, plan, config, result, dry_run, progress)
 
     result.log("Sync complete." if not dry_run else "Preview complete.")
+    if cat is not None:
+        cat.close()
     return result
 
 
@@ -1667,8 +2388,8 @@ def remove_file(path: str, result: SyncResult, dry_run: bool, playlist: bool) ->
         result.files_deleted += 1
         result.log(f"Removing file: {path}")
 
-    if not dry_run and os.path.exists(path):
-        os.remove(path)
+    if not dry_run and storage_mod.exists(path):
+        storage_mod.remove(path)
 
 
 def prune_empty_dirs(root_path: str) -> None:
@@ -1716,10 +2437,11 @@ def prune_after_removals(
     for stale_path in stale_music_files:
         normalized = os.path.normcase(stale_path)
         for drive in drives:
-            if normalized.startswith(os.path.normcase(os.path.join(drive, ""))):
-                parts = Path(os.path.relpath(stale_path, drive)).parts
+            if is_path_within_root(stale_path, drive):
+                rel = storage_mod.relative(stale_path, drive)
+                parts = Path(rel).parts
                 if parts:
-                    touched.add(os.path.join(drive, parts[0]))
+                    touched.add(storage_mod.join(drive, parts[0]))
                 break
 
     for artist_root in touched:
@@ -1734,22 +2456,29 @@ def iter_stale_music_files(
     device_scans: dict[str, DeviceScan],
 ) -> list[str]:
     stale_files: list[str] = []
+    dest = config.dest_drive
+    dest_desired = {os.path.normcase(rel) for rel in plan.desired_files_by_drive.get(dest, set())}
     for drive in (config.internal_drive, config.sd_drive):
         scan = device_scans.get(drive)
         if scan is None:
             continue
-        desired_files = plan.desired_files_by_drive[drive]
-
+        is_dest = os.path.normcase(drive) == os.path.normcase(dest)
+        for rel_path in scan.partials:
+            stale_files.append(storage_mod.join(drive, rel_path))
         for artist_folder, rel_files in scan.artist_files.items():
             assigned_drive = plan.assignments.get(artist_folder)
             for rel_path in rel_files:
-                if assigned_drive is None and artist_folder in plan.source_artists:
+                if _is_preserved_name(os.path.basename(rel_path)):
                     continue
-                if assigned_drive != drive:
-                    stale_files.append(os.path.join(drive, rel_path))
+                if is_dest:
+                    if assigned_drive is None and artist_folder in plan.source_artists:
+                        continue  # skipped-because-full, keep on dest
+                    if os.path.normcase(rel_path) in dest_desired:
+                        continue
+                    stale_files.append(storage_mod.join(drive, rel_path))
                     continue
-                if rel_path not in desired_files:
-                    stale_files.append(os.path.join(drive, rel_path))
+                # Unused volume: everything is stale (single dest).
+                stale_files.append(storage_mod.join(drive, rel_path))
     return stale_files
 
 
@@ -1759,32 +2488,158 @@ def iter_stale_playlists(
     device_scans: dict[str, DeviceScan],
 ) -> list[str]:
     stale_playlists: list[str] = []
+    dest = config.dest_drive
     for drive in (config.internal_drive, config.sd_drive):
         scan = device_scans.get(drive)
         if scan is None:
             continue
-        expected = plan.expected_playlists_by_drive[drive]
+        expected = plan.expected_playlists_by_drive.get(drive, set())
+        is_dest = os.path.normcase(drive) == os.path.normcase(dest)
         for playlist_name in scan.playlists:
             if playlist_name.lower() in MANAGED_PLAYLISTS:
-                continue      # likesync owns this file; it is not stale just because we did not write it
-            if playlist_name not in expected:
-                stale_playlists.append(os.path.join(drive, playlist_name))
+                continue
+            if _is_preserved_name(playlist_name):
+                continue
+            if is_dest and playlist_name in expected:
+                continue
+            stale_playlists.append(storage_mod.join(drive, playlist_name))
     return stale_playlists
+
+
+def album_folder(rel: str) -> str:
+    """Album directory for a *relative* path (`Artist - Album/...`)."""
+    parts = Path(rel).parts
+    return parts[0] if parts else ""
+
+
+def same_album_collisions(rels: list[str]) -> list[list[str]]:
+    """Unique rels that share a key, grouped by album; only folders with 2+ files."""
+    unique = sorted({os.path.normcase(r): r for r in rels}.values())
+    by_album: dict[str, list[str]] = defaultdict(list)
+    for rel in unique:
+        by_album[album_folder(rel)].append(rel)
+    return [paths for paths in by_album.values() if len(paths) > 1]
+
+
+def build_duplicate_groups(
+    config: AppConfig,
+    plan: LibraryPlan,
+    device_scans: dict[str, DeviceScan],
+    dest_manifest: manifest_mod.Manifest,
+    other_manifest: manifest_mod.Manifest,
+) -> list[DuplicateGroup]:
+    dest = device_scans.get(config.dest_drive) or DeviceScan(root=config.dest_drive)
+    other = device_scans.get(config.other_drive) or DeviceScan(root=config.other_drive)
+    groups: list[DuplicateGroup] = []
+
+    dest_audio = {os.path.normcase(p): p for p in dest.audio_paths}
+    other_audio = {os.path.normcase(p): p for p in other.audio_paths}
+    for folded, rel in sorted(dest_audio.items()):
+        if folded in other_audio:
+            groups.append(DuplicateGroup(
+                kind="cross-drive",
+                key=rel,
+                paths=[
+                    storage_mod.join(config.dest_drive, dest.original_rel(rel) or rel),
+                    storage_mod.join(config.other_drive, other.original_rel(rel) or other_audio[folded]),
+                ],
+                auto_fix=True,
+            ))
+
+    dest_by_key: dict[str, list[str]] = defaultdict(list)
+    for rel, record in dest_manifest.records.items():
+        if record.content_key:
+            dest_by_key[record.content_key].append(rel)
+    for folded, key in dest.content_keys.items():
+        if key:
+            dest_by_key[key].append(dest.original_rel(folded) or folded)
+    for key, rels in dest_by_key.items():
+        for album_rels in same_album_collisions(rels):
+            groups.append(DuplicateGroup(
+                kind="content-key",
+                key=key,
+                paths=[storage_mod.join(config.dest_drive, rel) for rel in album_rels],
+                auto_fix=True,
+            ))
+
+    try:
+        from likesync.keys import track_key
+        from likesync.tags import _from_filename
+    except Exception:
+        return groups
+
+    by_likes: dict[str, list[str]] = defaultdict(list)
+    for folder, entries in plan.source_files.items():
+        for entry in entries:
+            if Path(entry.rel_path).suffix.lower() not in AUDIO_EXT:
+                continue
+            artist, title = entry.artist, entry.title
+            if not artist or not title:
+                names = _from_filename(entry.rel_path)
+                artist, title = names.artist, names.title
+            if not artist or not title:
+                continue
+            by_likes[track_key(artist, title)].append(entry.rel_path)
+    for key, rels in by_likes.items():
+        for album_rels in same_album_collisions(rels):
+            groups.append(DuplicateGroup(
+                kind="likes-key",
+                key=key,
+                paths=album_rels,
+                auto_fix=False,
+            ))
+
+    for rel in dest.audio_paths:
+        folder = Path(rel).parts[0] if Path(rel).parts else ""
+        if folder in plan.source_artists:
+            continue
+        tags = _from_filename(rel)
+        artist, title = tags.artist, tags.title
+        if artist and title:
+            groups.append(DuplicateGroup(
+                kind="device-only",
+                key=track_key(artist, title),
+                paths=[storage_mod.join(config.dest_drive, rel)],
+                auto_fix=False,
+            ))
+    return groups
 
 
 def cleanup_library(
     config: AppConfig,
     dry_run: bool = True,
     progress_callback: ProgressCallback | None = None,
+    device_scans: dict[str, DeviceScan] | None = None,
+    plan: LibraryPlan | None = None,
 ) -> SyncResult:
     result = SyncResult()
-    device_scans = {
-        config.internal_drive: scan_device(config.internal_drive),
-        config.sd_drive: scan_device(config.sd_drive),
-    }
-    plan = build_library_plan(config, result, device_scans=device_scans)
-    if plan is None:
-        return result
+    cat: catalog_mod.Catalog | None = None
+    if device_scans is None or plan is None:
+        cat = refresh_catalog(config)
+        if device_scans is None:
+            device_scans = {
+                config.internal_drive: device_scan_from_catalog(
+                    cat, catalog_mod.KIND_INTERNAL, config.internal_drive),
+                config.sd_drive: device_scan_from_catalog(
+                    cat, catalog_mod.KIND_SD, config.sd_drive),
+            }
+        device_scans = _guard_device_scans(config, cat, device_scans, result)
+        if not require_live_dest(config, cat, result):
+            cat.close()
+            return result
+        if plan is None:
+            plan = build_library_plan(
+                config, result, device_scans=device_scans, catalog=cat)
+        if plan is None:
+            if cat is not None:
+                cat.close()
+            return result
+    elif not dry_run:
+        cat = catalog_mod.Catalog()
+        device_scans = _guard_device_scans(config, cat, device_scans or {}, result)
+        if not require_live_dest(config, cat, result):
+            cat.close()
+            return result
 
     stale_music_files = iter_stale_music_files(config, plan, device_scans)
     stale_playlists = iter_stale_playlists(config, plan, device_scans)
@@ -1794,6 +2649,12 @@ def cleanup_library(
     )
 
     for file_path in stale_music_files:
+        if cat is not None and not dry_run:
+            for drive in (config.internal_drive, config.sd_drive):
+                if is_path_within_root(file_path, drive):
+                    rel = storage_mod.relative(file_path, drive)
+                    cat.forget_dest_file(dest_kind_for(config, drive), drive, rel)
+                    break
         remove_file(file_path, result, dry_run, playlist=False)
         progress.step(f"Cleaning {os.path.basename(file_path)}")
 
@@ -1805,6 +2666,8 @@ def cleanup_library(
         prune_after_removals(config, plan, stale_music_files)
 
     result.log("Cleanup complete." if not dry_run else "Cleanup preview complete.")
+    if cat is not None:
+        cat.close()
     return result
 
 
@@ -2249,7 +3112,7 @@ def prompt_album_exclusions(current_value: str, source_dir: str) -> str:
         status_message = f"Toggled {toggled} album(s)."
 
 
-def prompt_float(label: str, current_value: float) -> float:
+def prompt_float(label: str, current_value: float, *, allow_zero: bool = False) -> float:
     print(label)
     print(f"Current: {current_value}")
     new_value = input("New value (blank to keep current): ").strip()
@@ -2263,8 +3126,8 @@ def prompt_float(label: str, current_value: float) -> float:
         pause()
         return current_value
 
-    if value <= 0:
-        print("Value must be greater than zero.")
+    if value < 0 or (value == 0 and not allow_zero):
+        print("Value must be greater than zero." if not allow_zero else "Value cannot be negative.")
         pause()
         return current_value
 
@@ -2272,9 +3135,16 @@ def prompt_float(label: str, current_value: float) -> float:
 
 
 def autodetect_storage_paths(config: AppConfig) -> None:
-    internal_drive, sd_drive = detect_walkman_paths()
-    config.internal_drive = internal_drive
-    config.sd_drive = sd_drive
+    config.auto_detect_drives = True
+    config.refresh_drives()
+    _persist_config(config)
+
+
+def _persist_config(config: AppConfig) -> None:
+    try:
+        config.persist()
+    except OSError:
+        pass
 
 
 def format_eta(seconds: float | None) -> str:
@@ -2291,12 +3161,21 @@ def format_eta(seconds: float | None) -> str:
 
 def render_progress(current: int, total: int, message: str, eta_seconds: float | None = None) -> None:
     width = 32
-    ratio = min(max(current / total, 0), 1)
+    ratio = min(max(current / max(total, 1), 0), 1)
     filled = int(width * ratio)
     bar = "#" * filled + "-" * (width - filled)
     eta_text = format_eta(eta_seconds)
-    safe_message = safe_console_text(message[:30])
-    line = f"\r[{bar}] {current}/{total} {safe_message:30} ETA {eta_text:>8}"
+    pct = int(ratio * 100)
+    # Copy phase reports byte totals; classic is one line: dest, filename, percent.
+    if total >= 1024 * 1024:
+        safe_message = safe_console_text(message[:44])
+        line = (
+            f"\r{safe_message:44} {pct:3d}% "
+            f"{human_size(current)}/{human_size(total)} ETA {eta_text:>8}"
+        )
+    else:
+        safe_message = safe_console_text(message[:30])
+        line = f"\r[{bar}] {current}/{total} {safe_message:30} ETA {eta_text:>8}"
     sys.stdout.write(line)
     sys.stdout.flush()
     if current >= total:
@@ -2324,20 +3203,36 @@ def run_with_progress(title: str, operation: Callable[[ProgressCallback], SyncRe
 
 
 def drive_label(drive: str, config: AppConfig) -> str:
-    if drive == config.internal_drive:
+    if drive and os.path.normcase(drive) == os.path.normcase(config.internal_drive):
         return "Internal"
-    if drive == config.sd_drive:
+    if drive and os.path.normcase(drive) == os.path.normcase(config.sd_drive):
         return "SD Card"
-    return drive
+    return drive or ""
+
+
+def catalog_index_line(config: AppConfig, report: ScanReport | None) -> str:
+    """Dashboard line: library / Walkman catalog age and key coverage."""
+    coverage = getattr(report, "catalog_coverage", None) or {}
+    src = coverage.get(catalog_mod.KIND_SOURCE)
+    dest_kind = catalog_mod.KIND_INTERNAL if config.dest_is_internal() else catalog_mod.KIND_SD
+    dest = coverage.get(dest_kind)
+    lib_age = catalog_mod.format_age(src.scanned_at if src else 0)
+    wm_age = catalog_mod.format_age(dest.scanned_at if dest else 0)
+    lib_cov = f"{src.key_count}/{src.file_count}" if src else "0/0"
+    wm_cov = f"{dest.key_count}/{dest.file_count}" if dest else "0/0"
+    plugged = "connected" if config.dest_is_connected() else "unplugged"
+    return (
+        f"Library index {lib_age} ({lib_cov} keys) · "
+        f"Walkman index {wm_age} ({wm_cov}) {plugged}"
+    )
 
 
 def overflow_warnings(config: AppConfig, report: ScanReport) -> list[tuple[str, DriveSpaceProjection]]:
     """Drives the current plan would overflow, surfaced as a pre-sync warning."""
     warnings: list[tuple[str, DriveSpaceProjection]] = []
-    for drive in (config.internal_drive, config.sd_drive):
-        info = report.space_projection.get(drive)
-        if info is not None and info.shortfall_bytes > 0:
-            warnings.append((drive_label(drive, config), info))
+    info = report.space_projection.get(config.dest_drive)
+    if info is not None and info.shortfall_bytes > 0:
+        warnings.append((drive_label(config.dest_drive, config), info))
     return warnings
 
 
@@ -2581,9 +3476,22 @@ def render_dashboard(config: AppConfig, report: ScanReport) -> None:
     print(bar)
     print(f" Source library : {config.source_dir}")
     print(f" Playlist source: {config.playlist_dir}")
-    print(f" Internal music : {config.internal_drive} ({internal_size} used / {config.internal_max_gb:.1f} GB)")
-    print(f" SD card music  : {config.sd_drive} ({sd_size} used / {config.sd_max_gb:.1f} GB)")
+    dest_is_internal = os.path.normcase(config.dest_drive) == os.path.normcase(config.internal_drive)
+    internal_mark = " dest" if dest_is_internal else " unused"
+    sd_mark = " dest" if not dest_is_internal else " unused"
+    internal_cap = human_size(config.internal_max_bytes) if config.internal_max_bytes else "live"
+    sd_cap = human_size(config.sd_max_bytes) if config.sd_max_bytes else "live"
+    print(f" Dest drive     : {drive_label(config.dest_drive, config)} ({config.dest})")
+    print(f" Internal music : {config.internal_drive} ({internal_size} used / {internal_cap}){internal_mark}")
+    print(f" SD card music  : {config.sd_drive} ({sd_size} used / {sd_cap}){sd_mark}")
+    unused_used = _drive_used_size(report, config.other_drive)
+    if unused_used:
+        print(_yellow(
+            f" {drive_label(config.other_drive, config)} leftover will be cleared "
+            f"({human_size(unused_used)})"
+        ))
     print(f" Source size    : {source_size}")
+    print(f" Index          : {catalog_index_line(config, report)}")
     print(f" Excluded albums: {excluded_summary}")
     print(
         f" Internal budget: {human_size(config.internal_music_budget_bytes)}"
@@ -2645,8 +3553,9 @@ def render_dashboard(config: AppConfig, report: ScanReport) -> None:
     print(f" {_cyan('4.')} View album changes     {_cyan('12.')} Upload scrobbles")
     print(f" {_cyan('5.')} View duplicate inbox   {_cyan('13.')} Edit sync settings")
     print(f" {_cyan('6.')} View removals          {_cyan('14.')} Edit Last.fm settings")
-    print(f" {_cyan('7.')} Preview sync summary   {_cyan('15.')} Quit")
-    print(f" {_cyan('8.')} Run sync")
+    print(f" {_cyan('7.')} Preview sync summary   {_cyan('15.')} Index library")
+    print(f" {_cyan('8.')} Run sync               {_cyan('16.')} Index Walkman")
+    print(f"                                   {_cyan('17.')} Quit")
 
 
 def render_result(title: str, result: SyncResult) -> None:
@@ -2783,18 +3692,24 @@ def view_duplicate_inbox(config: AppConfig, report: ScanReport) -> None:
     clear_screen()
     print("Duplicate Inbox")
     print("=" * 15)
-    if not report.duplicate_tracks:
-        print("No duplicate songs were found across internal and SD storage.")
+    groups = report.duplicate_groups or []
+    if not groups:
+        print("No duplicate groups.")
         pause()
         return
 
-    print(f"Found {len(report.duplicate_tracks)} duplicate song(s).")
-    print("These will be auto-fixed during sync based on the planned playlist/device layout.\n")
-    for rel_path in report.duplicate_tracks[:80]:
-        assigned_drive = report.plan.file_locations.get(rel_path) if report.plan else None
-        print(f"  {rel_path} -> keep on {drive_label(assigned_drive, config) if assigned_drive else 'planned device'}")
-    if len(report.duplicate_tracks) > 80:
-        print(f"\n... and {len(report.duplicate_tracks) - 80} more")
+    print(f"Found {len(groups)} group(s). Auto-fix is path/content-key identity only.\n")
+    shown = 0
+    for group in groups:
+        mark = "auto-fix" if group.auto_fix else "inbox"
+        print(f"  [{mark}] {group.kind}  {group.key}")
+        for path in group.paths:
+            print(f"      {path}")
+        shown += 1
+        if shown >= 40:
+            break
+    if len(groups) > 40:
+        print(f"\n... and {len(groups) - 40} more")
     pause()
 
 
@@ -2824,13 +3739,25 @@ def render_preview_summary(config: AppConfig, report: ScanReport) -> None:
         pause()
         return
 
-    print(f"Albums to internal : {report.result.artists_internal}")
-    print(f"Albums to SD card  : {report.result.artists_sd}")
+    dest_label = drive_label(config.dest_drive, config)
+    other_label = drive_label(config.other_drive, config)
+    print(f"Destination        : {dest_label} ({config.dest})")
+    print(f"Device             : {config.device_kind}")
+    print(f"Albums to dest     : {report.result.artists_internal + report.result.artists_sd}")
     print(f"Albums excluded    : {report.result.artists_excluded}")
     print(f"Albums skipped     : {report.result.artists_skipped}")
     print(f"Albums to add      : {report.albums_to_add}")
     print(f"Albums to remove   : {report.albums_to_remove}")
-    print(f"Duplicate songs    : {len(report.duplicate_tracks)}")
+    other_stale = [
+        path for path in report.stale_music_files
+        if is_path_within_root(path, config.other_drive)
+    ]
+    if other_stale:
+        print(_yellow(
+            f"{other_label} → {dest_label}: {len(other_stale)} file(s) will be removed "
+            "from the unused volume."
+        ))
+    print(f"Duplicate groups   : {len(report.duplicate_groups)}")
     print(f"Files to remove    : {len(report.stale_music_files)}")
     print(f"Playlists to remove: {len(report.stale_playlists)}")
     print(f"Playlist path misses: {report.result.skipped_entries}")
@@ -2866,7 +3793,7 @@ def edit_sync_settings(config: AppConfig) -> None:
         clear_screen()
         print("Sync Settings")
         print("=" * 13)
-        print("1. Auto-detect Walkman paths")
+        print("1. Auto-detect Walkman paths (label WALKMAN + the other removable volume)")
         print("2. Edit source library path")
         print("3. Edit playlist source path")
         print("4. Edit internal music path")
@@ -2874,8 +3801,13 @@ def edit_sync_settings(config: AppConfig) -> None:
         print("6. Edit internal storage limit")
         print("7. Edit internal safety buffer")
         print("8. Edit SD storage limit")
-        print("9. Select excluded albums")
-        print("10. Back")
+        print("9. Destination drive (internal / sd / auto)")
+        print("10. Device profile (cinder / android-walkman)")
+        print("11. Copy workers (1 = default)")
+        print("12. Select excluded albums")
+        print("13. Index library")
+        print("14. Index Walkman")
+        print("15. Back")
         choice = input("\nSelect an option: ").strip()
 
         if choice == "1":
@@ -2888,22 +3820,30 @@ def edit_sync_settings(config: AppConfig) -> None:
         if choice == "2":
             clear_screen()
             config.source_dir = prompt_path("Change source library path", config.source_dir)
+            _persist_config(config)
             continue
         if choice == "3":
             clear_screen()
             config.playlist_dir = prompt_path("Change playlist source path", config.playlist_dir)
+            _persist_config(config)
             continue
         if choice == "4":
             clear_screen()
             config.internal_drive = prompt_path("Change internal music path", config.internal_drive)
+            config.auto_detect_drives = False
+            _persist_config(config)
             continue
         if choice == "5":
             clear_screen()
             config.sd_drive = prompt_path("Change SD card music path", config.sd_drive)
+            config.auto_detect_drives = False
+            _persist_config(config)
             continue
         if choice == "6":
             clear_screen()
-            config.internal_max_gb = prompt_float("Change internal storage limit (GB)", config.internal_max_gb)
+            config.internal_max_gb = prompt_float(
+                "Change internal storage limit (GB, 0 = live)", config.internal_max_gb, allow_zero=True)
+            _persist_config(config)
             continue
         if choice == "7":
             clear_screen()
@@ -2911,25 +3851,67 @@ def edit_sync_settings(config: AppConfig) -> None:
                 "Change internal safety buffer (GB)",
                 config.internal_safety_buffer_gb,
             )
+            _persist_config(config)
             continue
         if choice == "8":
             clear_screen()
-            config.sd_max_gb = prompt_float("Change SD storage limit (GB)", config.sd_max_gb)
+            config.sd_max_gb = prompt_float(
+                "Change SD storage limit (GB, 0 = live)", config.sd_max_gb, allow_zero=True)
+            _persist_config(config)
             continue
         if choice == "9":
+            clear_screen()
+            print(f"Current dest: {config.dest}  (internal | sd | auto)")
+            value = input("New dest (blank to keep): ").strip().lower()
+            if value in ("internal", "sd", "auto"):
+                config.dest = value
+                _persist_config(config)
+            pause()
+            continue
+        if choice == "10":
+            clear_screen()
+            print(f"Current device: {config.device_kind}  (cinder | android-walkman)")
+            value = input("New profile (blank to keep): ").strip().lower().replace(" ", "-")
+            if value in ("android", "zx500", "a100"):
+                value = walkman_mod.KIND_ANDROID
+            if value in walkman_mod.DEVICE_KINDS:
+                config.device_kind = value
+                _persist_config(config)
+            pause()
+            continue
+        if choice == "11":
+            clear_screen()
+            print(f"Current copy workers: {config.copy_workers}  (1 = default, dest LUN only)")
+            raw = input("New value (blank to keep): ").strip()
+            if raw:
+                try:
+                    config.copy_workers = max(int(raw), 1)
+                    _persist_config(config)
+                except ValueError:
+                    print("Please enter a whole number.")
+            pause()
+            continue
+        if choice == "12":
             clear_screen()
             updated_value = prompt_album_exclusions(config.excluded_albums, config.source_dir)
             if updated_value == config.excluded_albums:
                 continue
             config.excluded_albums = updated_value
-            try:
-                save_env_value("SYNC_EXCLUDED_ALBUMS", updated_value)
-                print("Saved excluded albums to .env")
-            except OSError as exc:
-                print(f"Updated excluded albums, but could not save to .env: {exc}")
+            _persist_config(config)
+            print("Saved excluded albums.")
             pause()
             continue
-        if choice == "10":
+        if choice == "13":
+            result = index_library(config, status=lambda message: safe_print(_dim(f"  {message}")))
+            render_result("Library index", result)
+            pause()
+            continue
+        if choice == "14":
+            result = index_walkman(config, status=lambda message: safe_print(_dim(f"  {message}")))
+            render_result("Walkman index", result)
+            pause()
+            continue
+        if choice == "15":
             return
         print("Invalid selection.")
         pause()
@@ -3016,7 +3998,10 @@ def run_tui() -> None:
         if choice == "8":                                       # ← was 7
             preview = run_with_progress(
                 "Sync Preview",
-                lambda progress: sync_library(config, dry_run=True, progress_callback=progress),
+                lambda progress: sync_library(
+                    config, dry_run=True, progress_callback=progress,
+                    device_scans=report.device_scans, plan=report.plan,
+                ),
             )
             render_result("Sync Preview", preview)
 
@@ -3039,7 +4024,10 @@ def run_tui() -> None:
             try:
                 result = run_with_progress(
                     "Sync Running",
-                    lambda progress: sync_library(config, dry_run=False, progress_callback=progress),
+                    lambda progress: sync_library(
+                        config, dry_run=False, progress_callback=progress,
+                        device_scans=report.device_scans, plan=report.plan,
+                    ),
                 )
             except OSError as exc:
                 clear_screen()
@@ -3056,7 +4044,10 @@ def run_tui() -> None:
         if choice == "9":                                       # ← was 8
             result = run_with_progress(
                 "Cleanup Preview",
-                lambda progress: cleanup_library(config, dry_run=True, progress_callback=progress),
+                lambda progress: cleanup_library(
+                    config, dry_run=True, progress_callback=progress,
+                    device_scans=report.device_scans, plan=report.plan,
+                ),
             )
             render_result("Cleanup Preview", result)
             pause()
@@ -3065,7 +4056,10 @@ def run_tui() -> None:
         if choice == "10":                                      # ← was 9
             preview = run_with_progress(
                 "Cleanup Preview",
-                lambda progress: cleanup_library(config, dry_run=True, progress_callback=progress),
+                lambda progress: cleanup_library(
+                    config, dry_run=True, progress_callback=progress,
+                    device_scans=report.device_scans, plan=report.plan,
+                ),
             )
             render_result("Cleanup Preview", preview)
             confirm = input("\nDelete the stale files shown above? [y/N]: ").strip().lower()
@@ -3075,7 +4069,10 @@ def run_tui() -> None:
 
             result = run_with_progress(
                 "Cleanup Running",
-                lambda progress: cleanup_library(config, dry_run=False, progress_callback=progress),
+                lambda progress: cleanup_library(
+                    config, dry_run=False, progress_callback=progress,
+                    device_scans=report.device_scans, plan=report.plan,
+                ),
             )
             render_result("Cleanup Complete", result)
             report = scan_library_report(config)
@@ -3113,26 +4110,51 @@ def run_tui() -> None:
             report = scan_library_report(config)
             continue
 
-        if choice == "15":                                      # ← was 14
+        if choice == "15":
+            result = index_library(config, status=lambda message: safe_print(_dim(f"  {message}")))
+            render_result("Library index", result)
+            report = scan_library_report(config)
+            pause()
+            continue
+
+        if choice == "16":
+            result = index_walkman(config, status=lambda message: safe_print(_dim(f"  {message}")))
+            render_result("Walkman index", result)
+            report = scan_library_report(config)
+            pause()
+            continue
+
+        if choice == "17":
             break
 
         print("Invalid selection.")
         pause()
 
 
-def _main() -> None:
+def _main() -> int:
     """Full-screen front-end by default; `--classic` keeps the original scrolling menu."""
+    walkman_mod.ensure_repo_cwd()
+    if "--bench-copy" in sys.argv[1:]:
+        args = [arg for arg in sys.argv[1:] if arg != "--bench-copy"]
+        dest = args[0] if args else AppConfig().dest_drive
+        print(copyutil.bench_copy(dest))
+        return 0
     if "--classic" in sys.argv[1:]:
+        import tui
+        tui.prepare_console()
         run_tui()
-        return
+        return 0
     try:
         import app
     except Exception as exc:                      # never leave the user without a UI
         print(f"full-screen UI unavailable ({exc}); falling back to the classic menu.\n")
+        import tui
+        tui.prepare_console()
         run_tui()
-        return
-    raise SystemExit(app.main())
+        return 0
+    return app.main()
 
 
 if __name__ == "__main__":
-    _main()
+    import tui
+    raise SystemExit(tui.run_with_hold(_main))

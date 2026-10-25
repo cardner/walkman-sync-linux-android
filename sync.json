@@ -1,0 +1,13 @@
+{
+  "source_dir": "\\\\WillineauVault\\Music",
+  "playlist_dir": "\\\\WillineauVault\\Music",
+  "internal_drive": "F:\\MUSIC",
+  "sd_drive": "G:\\MUSIC",
+  "dest": "auto",
+  "internal_max_gb": 0.0,
+  "sd_max_gb": 0.0,
+  "excluded_albums": "",
+  "copy_workers": 1,
+  "auto_detect_drives": true,
+  "device_kind": "cinder"
+}

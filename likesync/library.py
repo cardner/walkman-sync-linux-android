@@ -53,6 +53,30 @@ class LibraryIndex:
         progress: Callable[[int, int, str], None] | None = None,
     ) -> "LibraryIndex":
         index = cls(source_dir)
+        rows = _catalog_source_rows(source_dir)
+        if rows:
+            audio_rows = [row for row in rows if Path(row.rel).suffix.lower() in AUDIO_EXT]
+            total = len(audio_rows)
+            live: set[str] = set()
+            for position, row in enumerate(audio_rows, start=1):
+                path = os.path.join(source_dir, row.rel)
+                live.add(path)
+                tags = cache.get(path, row.size, row.mtime)
+                entry = Entry(
+                    rel_path=row.rel,
+                    artist=row.artist or tags.best_artist,
+                    title=row.title or tags.title,
+                    album=row.album or tags.album,
+                    track_no=row.track_no or tags.track_no,
+                    size=row.size,
+                    rating=tags.rating,
+                    duration=tags.duration,
+                )
+                index.add(entry)
+                if progress and (position % 64 == 0 or position == total):
+                    progress(position, total, entry.folder)
+            cache.prune(live)
+            return index
         files = list(_walk_audio(source_dir))
         total = len(files)
         for position, (path, size, mtime) in enumerate(files, start=1):
@@ -115,6 +139,29 @@ class LibraryIndex:
 
     def __len__(self) -> int:
         return len(self.entries)
+
+
+def _catalog_source_rows(source_dir: str):
+    """Return catalog source rows when this library has already been indexed."""
+    try:
+        import catalog as catalog_mod
+    except Exception:
+        return []
+    path = catalog_mod.resolve_path()
+    if not path.is_file():
+        return []
+    cat = None
+    try:
+        cat = catalog_mod.Catalog(path)
+        info = cat.volume_for_root(catalog_mod.KIND_SOURCE, source_dir)
+        if info is None or not info.file_count:
+            return []
+        return cat.files_for(catalog_mod.KIND_SOURCE, source_dir)
+    except Exception:
+        return []
+    finally:
+        if cat is not None:
+            cat.close()
 
 
 def _walk_audio(root: str) -> Iterable[tuple[str, int, float]]:

@@ -288,6 +288,53 @@ class TestDeviceOutputs(EngineCase):
         self.assertEqual(set(reloaded.liked), set(plan.desired))
         self.assertFalse(reloaded.first_run)
 
+    def test_foreign_import_is_left_in_place(self) -> None:
+        self.write_device([("Artist", "One")])
+        Path(self.device_root, "cinder_liked_import.tsv").write_text(
+            "# listen_pull liked import\nArtist\tOne\n", encoding="utf-8")
+        self.state.liked = {track_key("Artist", "One"): {"artist": "Artist", "title": "One"},
+                            track_key("Artist", "Two"): {"artist": "Artist", "title": "Two"}}
+        self.state.set_snapshot("device", {track_key("Artist", "One"): {"artist": "Artist", "title": "One"}})
+        views = engine.gather(self.config, self.index, None, self.state)
+        self.assertTrue(views["device"].additive_only)
+        plan = engine.build_plan(self.config, self.index, views, self.state)
+        engine.apply_plan(self.config, plan, self.state, self.index, None, dry_run=False)
+        body = Path(self.device_root, "cinder_liked_import.tsv").read_text(encoding="utf-8")
+        self.assertIn("listen_pull", body)
+        self.assertNotIn("likesync", body)
+
+    def test_android_skips_cinder_import_tsv(self) -> None:
+        self.config.device_import = False
+        music = os.path.join(self.device_root, "Music")
+        present = os.path.join("Artist - Album", "01 - Artist - One.flac")
+        os.makedirs(os.path.join(music, "Artist - Album"), exist_ok=True)
+        Path(music, present).write_bytes(b"0")
+        self.state.liked = {track_key("Artist", "One"): {"artist": "Artist", "title": "One"}}
+        self.write_device([("Artist", "One")])
+        views = engine.gather(self.config, self.index, None, self.state)
+        self.assertFalse(views["device"].available)
+        plan = engine.build_plan(self.config, self.index, views, self.state)
+        engine.apply_plan(self.config, plan, self.state, self.index, None, dry_run=False)
+        self.assertFalse(Path(self.device_root, "cinder_liked_import.tsv").exists())
+        self.assertTrue(Path(music, "Liked Songs.m3u8").is_file())
+
+    def test_liked_songs_playlist_is_dest_only(self) -> None:
+        sd = os.path.join(self.root, "sd")
+        os.makedirs(os.path.join(sd, "Music"), exist_ok=True)
+        self.config.sd_root = sd
+        self.config.dest = "internal"
+        music = os.path.join(self.device_root, "Music")
+        present = os.path.join("Artist - Album", "01 - Artist - One.flac")
+        os.makedirs(os.path.join(music, "Artist - Album"), exist_ok=True)
+        Path(music, present).write_bytes(b"0")
+        Path(sd, "Music", "Liked Songs.m3u8").write_text("#EXTM3U\nold\n", encoding="utf-8")
+        self.write_device([("Artist", "One")])
+        views = engine.gather(self.config, self.index, None, self.state)
+        plan = engine.build_plan(self.config, self.index, views, self.state)
+        engine.apply_plan(self.config, plan, self.state, self.index, None, dry_run=False)
+        self.assertTrue(Path(music, "Liked Songs.m3u8").is_file())
+        self.assertFalse(Path(sd, "Music", "Liked Songs.m3u8").is_file())
+
 
 class TestMusicBee(EngineCase):
     def test_playlist_round_trip(self) -> None:
@@ -316,6 +363,10 @@ class TestDeviceFiles(unittest.TestCase):
             volume = device_mod.DeviceVolume(root=folder)
             loved = device_mod.read_loved(volume)
         self.assertEqual(set(loved), {track_key("Artist", "Title"), track_key("B", "T")})
+
+    def test_import_header_says_replaces(self) -> None:
+        self.assertIn("replaces", device_mod.IMPORT_HEADER.lower())
+        self.assertNotIn("merges", device_mod.IMPORT_HEADER.lower())
 
 
 if __name__ == "__main__":

@@ -28,11 +28,21 @@ from . import musicbee as musicbee_mod
 from .config import LikesConfig
 from .keys import split_key
 from .library import Entry, LibraryIndex
+
+
+def _leaf(path: str) -> str:
+    return path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] if path else ""
 from .lastfm import Lastfm, LastfmError
 from .state import State
 
 SOURCES = ("device", "lastfm", "musicbee")
 Progress = Callable[[str, int, int], None]
+
+
+def _snapshot_key(config: LikesConfig, name: str) -> str:
+    if name == "device":
+        return config.device_snapshot_key
+    return name
 
 
 @dataclass
@@ -115,17 +125,24 @@ def gather(
     # ── device ──────────────────────────────────────────────────
     volumes = [volume for volume in device_mod.volumes(config.internal_root, config.sd_root)
                if volume.present]
-    if volumes:
+    if volumes and config.device_import:
         view = views["device"]
         view.available = True
         view.tracks = device_mod.read_all(volumes)
         pending = [volume for volume in volumes if volume.import_pending]
-        if pending:
+        foreign = [volume for volume in volumes if volume.import_is_foreign]
+        if foreign:
+            view.additive_only = True
+            view.note = ("foreign liked import (listen_pull/Flint) is on the device — "
+                         "additive only, file left in place")
+        elif pending:
             view.additive_only = True
             view.note = ("import from the last run is still on the device — Cinder has not "
                          "merged it yet, so removals here are not trusted")
         else:
             view.note = f"{len(volumes)} volume(s)"
+    elif volumes:
+        views["device"].note = "playlist only (no Cinder liked store)"
     else:
         views["device"].note = "no Walkman volume found"
     if progress:
@@ -180,8 +197,9 @@ def build_plan(config: LikesConfig, index: LibraryIndex, views: dict[str, Source
     for name, view in views.items():
         if not view.available:
             continue
-        previous = state.snapshot(name).keys
-        seen_before = bool(previous) or name in state.snapshots
+        snap_name = _snapshot_key(config, name)
+        previous = state.snapshot(snap_name).keys
+        seen_before = bool(previous) or snap_name in state.snapshots
         for key in view.tracks:
             if not seen_before or key not in previous:
                 added_by.setdefault(key, set()).add(name)
@@ -248,7 +266,12 @@ def build_plan(config: LikesConfig, index: LibraryIndex, views: dict[str, Source
         plan.matched[key] = entry
         placed = False
         for volume in volumes:
-            if os.path.isfile(os.path.join(volume.music_dir, entry.rel_path)):
+            try:
+                from storage import exists, join
+                held = exists(join(volume.music_dir, entry.rel_path))
+            except Exception:
+                held = os.path.isfile(os.path.join(volume.music_dir, entry.rel_path))
+            if held:
                 plan.playlist[volume.root].append(entry.rel_path)
                 placed = True
                 break        # one drive holds it; sync.py never puts the same file on both
@@ -279,6 +302,21 @@ def _meta_for(key: str, views: dict[str, SourceView], sources: set[str]) -> dict
                 return {"artist": meta["artist"], "title": meta["title"]}
     artist, title = split_key(key)
     return {"artist": artist, "title": title}
+
+
+def _dest_volume(volumes, config: LikesConfig, plan: Plan):
+    """The one volume Liked Songs is written to (music sync's dest)."""
+    if not volumes:
+        return None
+    dest = (config.dest or "auto").strip().lower()
+    if dest == "sd":
+        return volumes[1] if len(volumes) > 1 else volumes[0]
+    if dest == "internal":
+        return volumes[0]
+    for volume in volumes:
+        if plan.playlist.get(volume.root):
+            return volume
+    return volumes[0]
 
 
 # ────────────────────────────────────────────────────────── apply
@@ -337,33 +375,44 @@ def apply_plan(
     tracks = [plan.desired[key] for key in plan.desired]
     device_sink = plan.sinks["device"]
     device_needs_import = bool(device_sink.add or device_sink.remove)
+    dest_volume = _dest_volume(volumes, config, plan)
     for position, volume in enumerate(volumes):
         # The liked store lives at /contents (the internal volume); the SD card has no copy.
         if config.device_import and position == 0:
-            if device_needs_import:
+            if volume.import_is_foreign:
+                result.log(f"Device: leaving foreign {_leaf(volume.import_path)} in place "
+                           "(listen_pull/Flint owns this session)")
+            elif device_needs_import:
                 device_mod.write_import(volume, tracks, dry_run)
-                result.device_written.append(str(volume.import_path))
-                result.log(f"Device: wrote {len(tracks)} track(s) to {volume.import_path.name} "
-                           f"(Cinder merges it on its next start)")
+                result.device_written.append(volume.import_path)
+                result.log(f"Device: wrote {len(tracks)} track(s) to {_leaf(volume.import_path)} "
+                           f"(Cinder replaces its liked set on the next start)")
             elif volume.import_pending:
                 # The device already holds exactly this list, so the pending import is a no-op —
                 # and leaving it there would keep the device marked additive-only for ever, which
                 # means an unlike made ON the device could never propagate. Clear it instead.
                 if not dry_run:
                     try:
-                        volume.import_path.unlink()
-                    except OSError:
-                        pass
-                result.log(f"Device: dropped a redundant {volume.import_path.name} "
+                        from storage import remove
+                        remove(volume.import_path)
+                    except Exception:
+                        try:
+                            os.remove(volume.import_path)
+                        except OSError:
+                            pass
+                result.log(f"Device: dropped a redundant {_leaf(volume.import_path)} "
                            f"(the device is already in sync)")
         if config.device_playlist:
+            is_dest = dest_volume is not None and os.path.normcase(volume.root) == os.path.normcase(dest_volume.root)
             rel_paths = plan.playlist.get(volume.root, [])
-            if rel_paths:
+            if is_dest and rel_paths:
                 device_mod.write_playlist(volume, rel_paths, dry_run)
                 result.playlists_written[volume.root] = len(rel_paths)
                 result.log(f"Device: {volume.playlist_path} — {len(rel_paths)} track(s)")
-            elif device_mod.remove_playlist(volume, dry_run):
-                result.log(f"Device: removed empty {volume.playlist_path.name}")
+            elif is_dest and not rel_paths and device_mod.remove_playlist(volume, dry_run):
+                result.log(f"Device: removed empty {_leaf(volume.playlist_path)}")
+            elif not is_dest and device_mod.remove_playlist(volume, dry_run):
+                result.log(f"Device: removed {_leaf(volume.playlist_path)} from unused volume")
 
     # ── MusicBee ────────────────────────────────────────────────
     if config.musicbee_export_playlist:
@@ -391,7 +440,8 @@ def apply_plan(
         if plan.views["device"].available:
             # The device's own export still shows the old list until Cinder consumes the import;
             # `additive_only` on the next run is what keeps that from reading as removals.
-            state.set_snapshot("device", plan.desired if config.device_import
+            state.set_snapshot(_snapshot_key(config, "device"),
+                               plan.desired if config.device_import
                                else plan.views["device"].tracks)
         if plan.views["musicbee"].available or config.musicbee_export_playlist:
             state.set_snapshot("musicbee", plan.desired if config.musicbee_export_playlist

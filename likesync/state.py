@@ -77,6 +77,16 @@ class State:
     def set_snapshot(self, name: str, keys: dict[str, dict]) -> None:
         self.snapshots[name] = Snapshot(keys=dict(keys), taken=time.time())
 
+    def migrate_legacy_device_snapshot(self, device_id: str) -> bool:
+        """Move unkeyed `snapshots.device` onto `device:<id>` once. Returns True if saved state should be written."""
+        if not device_id or "device" not in self.snapshots:
+            return False
+        keyed = f"device:{device_id}"
+        legacy = self.snapshots.pop("device")
+        if keyed not in self.snapshots:
+            self.snapshots[keyed] = legacy
+        return True
+
     @property
     def first_run(self) -> bool:
         """No snapshot yet → every source is additive; nothing is ever treated as an unlike."""
