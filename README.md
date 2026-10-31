@@ -1,37 +1,39 @@
-# Sony sync
+# Walkman Sync
 
-Two things live here, and they are deliberately separate:
-
-| | what it does | run it |
-|---|---|---|
-| **music sync** (`sync.py`) | plans and copies the library onto the Walkman's two volumes, writes the playlists, removes what no longer belongs, uploads `.scrobbler.log` to Last.fm | `python sync.py` or the **Walkman Sync** shortcut |
-| **likes sync** (`likesync/`) | keeps *liked* in step across the Walkman, Last.fm and MusicBee, and writes a **Liked Songs** playlist onto the device | `python -m likesync sync` |
-
-`app.py` is the full-screen front-end both of them share; `tui.py` is the terminal toolkit it is
-built from. Everything is standard library only — no pip install, no venv, any Python 3.10+.
+One `walkman-sync` binary (Windows `.exe`, macOS) — library copy, likes, scrobbles, and AudioMuse for Sony Walkmans. No Python runtime.
 
 ```
-python3 launch.py --install-shortcut  # Windows: Desktop + Start Menu
-                                      # macOS: Desktop .command + ~/Applications .app
-python3 launch.py                     # own window if double-clicked; in-place in a terminal
-python3 sync.py                       # full-screen UI in the current terminal
-python3 sync.py --classic             # the original scrolling menu, unchanged
-python3 -m likesync status            # likes only, no UI, read-only
-python3 -m unittest discover -s tests
+cargo build --release
+target/release/walkman-sync --install-shortcut   # Windows: Desktop + Start Menu
+                                                 # macOS: Desktop .command + ~/Applications .app
+target/release/walkman-sync                      # dashboard in the current terminal
+cargo test
 ```
 
-Python 3.10+ on PATH (no venv, no pip). After `--install-shortcut`:
+After `--install-shortcut`:
 
-* **Windows** — pin **Walkman Sync** from the Start Menu or the desktop. The shortcut uses
-  `assets/walkman-sync.ico`. Double-click `launch.pyw` for the same dedicated window without a
-  bootstrap console flash. Windows Terminal is used when it is installed; otherwise a plain console.
-* **macOS** — double-click **Walkman Sync** on the Desktop (Terminal.app), or drag
-  `~/Applications/Walkman Sync.app` to the Dock. Both pick up `assets/walkman-sync.png`. Cinder
-  mounts as `/Volumes/WALKMAN`; an Android card in a USB reader is `/Volumes/<label>/Music`. A
-  Windows UNC library path (`\\server\share`) is tried as `/Volumes/<share>` when the UNC is missing.
+* **Windows** — pin **Walkman Sync** from the Start Menu or the desktop. The shortcut uses `walkman-sync.ico` next to the exe (extracted from the binary on install). Double-click opens a console. Windows Terminal is used when `wt.exe` is on PATH; otherwise a plain console.
+* **macOS** — double-click **Walkman Sync** on the Desktop (Terminal.app), or drag `~/Applications/Walkman Sync.app` to the Dock. Both pick up `walkman-sync.png`. Cinder mounts as `/Volumes/WALKMAN`; an Android card in a USB reader is `/Volumes/<label>/Music`. A Windows UNC library path (`\\server\share`) is tried as `/Volumes/<share>` when the UNC is missing.
 
-`python3 sync.py` is unchanged for running inside a terminal you already have. MusicBee likes stay
-Windows-only.
+Re-running `--install-shortcut` overwrites the old Python `.lnk` / `.command` / `.app` at the same names, so existing pins keep working.
+
+Settings live in `sync.json` (nested `devices` map keyed by volume serial). The file catalog is `.sony-sync/catalog.sqlite`. Likes state is `.likesync/state.json`. Same schema as the old Python app, so a library is not re-hashed from scratch.
+
+MusicBee likes stay Windows-only. Helper scripts `audit_scrobbles.py`, `paste_lastfm.py`, and `tracklist_scrobbler.py` are still Python and are not part of the app.
+
+---
+
+## Scan architecture
+
+First index is slow if every MP3 is hashed end-to-end. The dashboard is slow if every launch walks the Walkman over USB. The binary:
+
+* **MP3 identity** `mp3h-`: ID3 skip + first MPEG frame + Xing/Info/VBRI (or audio length). Existing `mp3-` rows stay until size/mtime change. Dest MP3 keys come from the copy manifest only. Dest FLAC: STREAMINFO header only.
+* **Enumerate vs enrich:** walk `rel/size/mtime` with no audio open; open headers only for new/changed source files (and dest FLAC missing a key).
+* **Dashboard:** walk the **source** library (**audio only**). Nested album playlists, cover art, AppleDouble `._*`, and recycle/`@eaDir` trees are not cataloged. Playlists come from the playlist folder rewrite onto MUSIC root. **Skip dest walk** iff the plugged serial already has a catalog (`volume_for_root(kind, live_path).file_count > 0`). First plug of Walkman B always walks. Card vs `adb://` / `mtp://` stay different serials.
+* **Walk dest** on Index Walkman, Sync, preview, Cleanup, `r` after `i`/`w`. Dest catalog is audio-only. Sync/Cleanup also list leftover nested sidecars (cover art, `.cue`/`.nfo`, nested `.m3u8`, `.partial`) for deletion. Root playlists, `cinder_*`, likes, and scrobble logs stay. After `i`/`w`, the report rebuilds from sqlite.
+* **Parallel enrich:** rayon on a local source disk; serial on UNC/ADB and on dest USB.
+
+No AcoustID. No dest MP3 hash over USB.
 
 ---
 
@@ -54,11 +56,16 @@ How to connect:
    After the copy, on the player: W. Music ▸ Update Database. On a Mac the card appears under
    `/Volumes/<label>/Music`.
 2. **ADB** (USB debugging) — if the unit allows it, re-detect mounts; dest URIs look like
-   `adb://SERIAL/sdcard/Music`. Works on Windows and macOS when `adb` is on PATH. Override the
-   binary with `SONY_SYNC_ADB`.
+   `adb://SERIAL/sdcard/Music`. Walkman Sync fetches Google platform-tools into
+   `%LOCALAPPDATA%\Walkman Sync\platform-tools` (Windows) or
+   `~/Library/Application Support/Walkman Sync/platform-tools` (macOS) on first use, so `adb`
+   does not need to be on PATH. A `platform-tools` folder next to the exe or in the app
+   directory is used if present. Override with `SONY_SYNC_ADB`; set `SONY_SYNC_NO_ADB_FETCH=1`
+   to skip the download. USB debugging must still be enabled on the player, and this computer
+   authorized. Google's Android SDK license applies to the fetched tools.
 3. **MTP File Transfer** — Windows only (Explorer's WALKMAN portable device), used when ADB is
-   locked. Slower, and skip-if-present is size-only. On a Mac with USB debugging locked, use the
-   card reader instead.
+   locked or `adb devices` sees nothing. Slower, and skip-if-present is size-only. On a Mac
+   with USB debugging locked, use the card reader instead.
 
 Hearts / bookmarks inside W. Music live in Sony's private database and are not written by this
 tool. Last.fm and MusicBee likes still land as the **Liked Songs** playlist.
@@ -69,7 +76,7 @@ tool. Last.fm and MusicBee likes still land as the **Liked Songs** playlist.
 
 The source library and album exclusions are shared. Each plugged player is its own profile,
 keyed by volume serial: mounts, dest (internal vs SD), cinder vs android-walkman, and disk
-budgets. Plug the Walkman you mean — Sony-sync matches it automatically. That unit's dest catalog
+budgets. Plug the Walkman you mean — Walkman Sync matches it automatically. That unit's dest catalog
 and likes snapshot stay separate, so syncing a ZX505 cannot sweep an A50.
 
 On-device files (`cinder_*`, `Liked Songs.m3u8`, `listen_sources.conf`, `.scrobbler.log`) were
@@ -95,8 +102,8 @@ musicbee an exported playlist (and optionally file-tag ratings)
 ```
 
 A three-way set comparison cannot tell "just loved over here" from "just unliked over there", so
-`likesync` keeps a snapshot of each source (`.likesync/state.json`) and diffs each source against
-**its own** previous snapshot. The rules that fall out of that:
+likes keep a snapshot of each source (`.likesync/state.json`) and diffs each source against
+**its own** previous snapshot. The device snapshot is keyed `device:<serial>`. The rules that fall out of that:
 
 * **first run is additive** — the union of all three, nothing is ever removed;
 * **a source that is not available contributes nothing** — an unplugged Walkman or a Last.fm
@@ -111,48 +118,26 @@ A three-way set comparison cannot tell "just loved over here" from "just unliked
 
 Everything is keyed on `artist + title`, normalised: case, curly punctuation, `feat.` credits and
 re-issue suffixes (`- Remastered 2009`, `(2021 Mix)`, `(Deluxe Edition)`) fold away, while
-anything that marks a *different recording* — live, remix, acoustic, demo — stays distinct. When
-the exact key misses, the primary artist is tried, then the album-folder artist, which is what
-matches Last.fm's `Little Simz feat. Cleo Sol` to the file tagged `Cleo Sol` on a Little Simz
-album. On the reference library that resolves **129 of 131** liked tracks; the two that miss are
-genuinely not in the library.
-
-The same normalisation exists on the device in `player/cinder-ffi/src/likes.rs` — the two sides
-have to agree or nothing lines up.
+anything that marks a *different recording* — live, remix, acoustic, demo — stays distinct.
 
 ### Setting it up
 
 1. **Last.fm** — credentials are read from the Walkman first (`listen_sources.conf` at the
-   volume root, the same file Cinder / listen_pull uses: `lastfm_user`, `lastfm_api_key`,
-   `lastfm_api_secret`, `lastfm_session_key`). Any field that is empty there falls back to
-   `.env` (`LASTFM_API_KEY` / `LASTFM_API_SECRET` / `LASTFM_USERNAME` / `LASTFM_SESSION_KEY`).
-   Sign in with `python -m likesync login` or the Last.fm screen; that writes `.env`. AudioMuse
-   `audiomuse_url` / `audiomuse_token` follow the same device-then-PC rule (`AUDIOMUSE_URL` /
-   `AUDIOMUSE_TOKEN` in `.env`). Sony-sync pulls AudioMuse mixes and scores; Navidrome playlists
-   stay listen_pull's.
-2. **MusicBee** — make a playlist of what you love (an auto-playlist on `Love` or `Rating ≥ 4`
-   works), then MusicBee ▸ right-click the playlist ▸ *auto-export as m3u* into the exported
-   playlists folder. `likesync` finds anything named `Loved` / `Liked` / `Favourites` on its own,
-   or set `musicbee_loved_playlist` explicitly. If MusicBee's own Last.fm love is switched on,
-   this step is optional — the loves arrive through Last.fm anyway.
-   To read stars from the files instead, set `musicbee_rating_threshold` to e.g. `4`.
+   volume root: `lastfm_user`, `lastfm_api_key`, `lastfm_api_secret`, `lastfm_session_key`). Any
+   field that is empty there falls back to `.env`. Sign in from the Last.fm screen. AudioMuse
+   `audiomuse_url` / `audiomuse_token` follow the same device-then-PC rule.
+2. **MusicBee** (Windows) — export a Loved/Liked playlist as `.m3u` into the playlists folder.
 3. **The device** — nothing to configure. The `Liked Songs.m3u8` playlist works on any Cinder
-   build; the hearts on the device only update on a build that has the liked-import (see below).
-
-Settings live in `likesync.json`; `python -m likesync config key=value` edits them.
+   build; the hearts on the device only update on a build that has the liked-import.
 
 ### What it writes
 
 | file | when |
 |---|---|
-| `<device>\MUSIC\Liked Songs.m3u8` | always, per drive, listing only that drive's tracks (a playlist that names a file on the other volume is a dead row) |
-| `<device>\cinder_liked_import.tsv` | when `device_import` is on (internal volume only — `cinder_liked.conf` lives at `/contents`) |
+| `<device>\MUSIC\Liked Songs.m3u8` | always, per dest drive, listing only that drive's tracks |
+| `<device>\cinder_liked_import.tsv` | when `device_import` is on (internal volume only) |
 | `<playlists>\Liked Songs.m3u8` | when `musicbee_export_playlist` is on |
 | Last.fm | `track.love` / `track.unlove`, one call per change, throttled to Last.fm's rate limit |
-
-`sync.py` knows to leave `Liked Songs.m3u8` alone at both ends: it is excluded from the source
-playlist scan (otherwise its whole-library span would collapse every album onto one drive) and
-from the stale-playlist sweep on the device.
 
 ### On the device
 
@@ -165,7 +150,7 @@ header is honoured: that means "everything was unliked".
 
 ## AudioMuse mixes and Channels scores
 
-Sony-sync owns the AudioMuse pull. Navidrome playlists stay with listen_pull. Same
+Walkman Sync owns the AudioMuse pull. Navidrome playlists stay with listen_pull. Same
 `listen_sources.conf` keys (`audiomuse_url` / `audiomuse_token`), then `.env`
 (`AUDIOMUSE_URL` / `AUDIOMUSE_TOKEN`).
 
@@ -191,28 +176,21 @@ reach Channels.
 ```
  WALKMAN SYNC                              walkman connected   last.fm Superwils0
  ┌─ Storage ──────────────────┐ ┌─ This sync ────────────────┐
- │ Internal ███████░░░ 41/54G │ │ Net  +6 albums  +1.2 GB    │
+ │ Internal 41G dest          │ │ +12 add  ~3 modify  -4 remove │
  ...
  › 1  Sync music to the Walkman
-   2  Album changes (what moves)
-   7  Likes: device ⇄ Last.fm ⇄ MusicBee
- ↑↓ move  ⏎ choose  r rescan  / filter  q quit
+   2  Plan (added / modified / removed)
+   r  Refresh plan
+   5  Likes: device ⇄ Last.fm ⇄ MusicBee
+ ↑↓ move  ⏎ choose  r refresh plan  q quit
 ```
 
-* one write per frame into the alternate screen buffer — no flicker, and your scrollback survives;
-* single keypresses, arrow keys, `/` to filter any list, `esc` to go back;
-* scans run on a worker thread with a live phase/ETA readout instead of freezing;
-* panels stack and the menu shrinks on a small terminal — the menu is never pushed off-screen;
-* CJK and accented titles are measured in display cells, so columns line up.
-
-Every screen is a pure `render_*(…) -> list[str]`, which is why `tests/test_tui.py` can render all
-of them headlessly against the real planner.
+Hotkeys: `1` sync, `2` plan, `r` refresh plan (walks dest), `5` likes, `i`/`w` index, `s` settings, `l` Last.fm, `q` quit.
 
 ## Tests
 
 ```
-python -m unittest discover -s tests      # merge rules, tags, keys, TUI, catalog, android dest
+cargo test
 ```
 
-The merge-rule tests are the ones that matter: they cover first run, removal propagation, an
-absent source, a pending device import, and both conflict policies.
+Covered without live hardware: two serials dest-skip vs must-walk, `mp3h-` stability across an ID3-only change, enumerate-only vs enrich, nested `sync.json` migration, `--install-shortcut` IconLocation / macOS `.command` paths (temp dirs), and audio-only walks that skip cover art / nested playlists / AppleDouble while marking leftover dest sidecars stale.

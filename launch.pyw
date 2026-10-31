@@ -1,4 +1,7 @@
-"""pythonw entry — no bootstrap console flash. See launch.py."""
-import launch
+"""Retired. Walkman Sync is the walkman-sync binary (no Python runtime)."""
+import sys
 
-raise SystemExit(launch.main())
+print("Walkman Sync is now the walkman-sync binary — no Python runtime.", file=sys.stderr)
+print("  cargo build --release", file=sys.stderr)
+print("  target/release/walkman-sync --install-shortcut", file=sys.stderr)
+sys.exit(1)

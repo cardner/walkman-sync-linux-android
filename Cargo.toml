@@ -1,0 +1,43 @@
+[package]
+name = "walkman-sync"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Walkman Sync — library copy, likes, and scrobbles for Sony Walkmans"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+blake2 = "0.10"
+crossterm = "0.28"
+dirs = "5"
+hex = "0.4"
+image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
+md5 = "0.7"
+rayon = "1"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = { version = "0.10", features = ["std"] }
+thiserror = "1"
+unicode-normalization = "0.1"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+walkdir = "2"
+ratatui = "0.29"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Console",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "walkman-sync"
+path = "src/main.rs"

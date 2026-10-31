@@ -316,13 +316,27 @@ class _Adb:
         return f"adb-{self.device}"
 
     def disk_usage(self) -> tuple[int, int] | None:
-        out = self._shell(f'df -P "{self.devpath}" 2>/dev/null | tail -n 1')
-        parts = out.split()
+        # toybox `df -P` is 512-byte blocks; `-kP` keeps POSIX columns at 1K.
+        out = self._shell(f'df -kP "{self.devpath}" 2>/dev/null')
+        unit = 1024
+        data = ""
+        for line in out.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            lower = text.lower()
+            if lower.startswith("filesystem"):
+                if "512-blocks" in lower or "512-byte" in lower:
+                    unit = 512
+                else:
+                    unit = 1024
+                continue
+            data = text
+        parts = data.split()
         if len(parts) >= 4:
             try:
-                # df -P: filesystem, 1k-blocks, used, available, ...
-                total = int(parts[1]) * 1024
-                free = int(parts[3]) * 1024
+                total = int(parts[1]) * unit
+                free = int(parts[3]) * unit
                 return total, free
             except ValueError:
                 return None
