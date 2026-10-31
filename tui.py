@@ -21,6 +21,7 @@ import shutil
 import sys
 import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # ─────────────────────────────────────────────────────────── colour
 
@@ -42,6 +43,14 @@ def _enable_vt() -> bool:
 
 
 COLOUR = _enable_vt()
+
+APP_TITLE = "Walkman Sync"
+MIN_COLS = 120
+MIN_ROWS = 36
+DETACH_PARENTS = frozenset({
+    "explorer.exe", "pythonw.exe",
+    "finder", "launchd",
+})
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -75,6 +84,188 @@ def style(text: str, fg: str | None = None, bg: str | None = None,
     if reverse:
         prefix += REVERSE
     return f"{prefix}{text}{RESET}" if prefix else text
+
+
+# ─────────────────────────────────────────────────────────── console window
+
+def parent_process_name() -> str:
+    """Basename of the parent process ('' if unknown). Used to spot Explorer / Finder launches."""
+    if os.name != "nt":
+        return _posix_parent_process_name()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+        invalid = ctypes.c_void_p(-1).value
+        if snap in (0, -1, invalid, 0xFFFFFFFF):
+            return ""
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if not kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+                return ""
+            names: dict[int, str] = {}
+            parent_pid = 0
+            pid = os.getpid()
+            while True:
+                names[entry.th32ProcessID] = entry.szExeFile
+                if entry.th32ProcessID == pid:
+                    parent_pid = entry.th32ParentProcessID
+                if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                    break
+            return names.get(parent_pid, "")
+        finally:
+            kernel32.CloseHandle(snap)
+    except Exception:
+        return ""
+
+
+def _posix_parent_process_name() -> str:
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ps", "-p", str(os.getppid()), "-o", "comm="],
+            capture_output=True, text=True, timeout=1,
+        )
+        name = (result.stdout or "").strip()
+        return Path(name).name
+    except Exception:
+        return ""
+
+
+def has_console() -> bool:
+    if os.name != "nt":
+        return bool(sys.stdin and sys.stdin.isatty())
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:
+        return bool(sys.stdin and sys.stdin.isatty())
+
+
+def prepare_console(title: str = APP_TITLE, min_cols: int = MIN_COLS,
+                    min_rows: int = MIN_ROWS) -> None:
+    """Title, disable Quick Edit, grow a tiny default host. Never shrinks a larger window."""
+    if os.name != "nt":
+        if sys.stdout.isatty():
+            sys.stdout.write(f"\033]0;{title}\007")
+            sys.stdout.flush()
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class SMALL_RECT(ctypes.Structure):
+            _fields_ = [("Left", wintypes.SHORT), ("Top", wintypes.SHORT),
+                        ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT)]
+
+        class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", COORD),
+                ("dwCursorPosition", COORD),
+                ("wAttributes", wintypes.WORD),
+                ("srWindow", SMALL_RECT),
+                ("dwMaximumWindowSize", COORD),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleTitleW(title)
+
+        stdin_handle = kernel32.GetStdHandle(-10)
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(stdin_handle, ctypes.byref(mode)):
+            # ENABLE_EXTENDED_FLAGS (0x80) must be set to change Quick Edit (0x40).
+            kernel32.SetConsoleMode(stdin_handle, (mode.value | 0x0080) & ~0x0040)
+
+        stdout_handle = kernel32.GetStdHandle(-11)
+        info = CONSOLE_SCREEN_BUFFER_INFO()
+        if not kernel32.GetConsoleScreenBufferInfo(stdout_handle, ctypes.byref(info)):
+            return
+        win_cols = info.srWindow.Right - info.srWindow.Left + 1
+        win_rows = info.srWindow.Bottom - info.srWindow.Top + 1
+        max_cols = info.dwMaximumWindowSize.X or min_cols
+        max_rows = info.dwMaximumWindowSize.Y or min_rows
+        new_cols = min(max(win_cols, min_cols), max_cols)
+        new_rows = min(max(win_rows, min_rows), max_rows)
+        if new_cols == win_cols and new_rows == win_rows:
+            return
+        buf_x = max(info.dwSize.X, new_cols)
+        buf_y = max(info.dwSize.Y, new_rows)
+        # COORD is passed by value; pack it as a 32-bit integer (y << 16 | x).
+        kernel32.SetConsoleScreenBufferSize(stdout_handle, (buf_y << 16) | (buf_x & 0xFFFF))
+        rect = SMALL_RECT(0, 0, new_cols - 1, new_rows - 1)
+        kernel32.SetConsoleWindowInfo(stdout_handle, True, ctypes.byref(rect))
+    except Exception:
+        return
+
+
+def should_hold_console(*, parent: str | None = None) -> bool:
+    if os.environ.get("WALKMAN_SYNC_HOLD") == "0":
+        return False
+    if not sys.stdin or not sys.stdin.isatty():
+        return False
+    name = (parent if parent is not None else parent_process_name()).lower()
+    return name in DETACH_PARENTS
+
+
+def hold_console(*, parent: str | None = None) -> None:
+    """Keep an Explorer-spawned console open so a traceback is readable."""
+    if not should_hold_console(parent=parent):
+        return
+    try:
+        print("\nPress any key to close.", file=sys.stderr, flush=True)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.getwch()
+        else:
+            input()
+    except Exception:
+        pass
+
+
+def run_with_hold(fn):
+    """Run `fn()` and pause on failure when the window would otherwise vanish."""
+    try:
+        result = fn()
+    except KeyboardInterrupt:
+        return 130
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            code = 0
+        if not isinstance(code, int):
+            code = 1
+        if code:
+            hold_console()
+        return code
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        hold_console()
+        return 1
+    code = 0 if result is None else int(result)
+    if code:
+        hold_console()
+    return code
 
 
 # ─────────────────────────────────────────────────────────── width

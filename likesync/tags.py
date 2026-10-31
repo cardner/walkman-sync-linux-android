@@ -23,7 +23,10 @@ try:  # optional, never required
 except Exception:  # pragma: no cover - depends on the host
     mutagen = None
 
-AUDIO_EXT = (".flac", ".mp3", ".m4a", ".aac", ".alac", ".wav")
+try:
+    from walkman import AUDIO_EXT
+except Exception:
+    AUDIO_EXT = (".flac", ".mp3", ".m4a", ".aac", ".alac", ".wav", ".dsf", ".dff", ".aiff", ".aif")
 
 
 @dataclass

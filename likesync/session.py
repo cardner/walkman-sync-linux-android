@@ -27,9 +27,19 @@ class Session:
 
     def __post_init__(self) -> None:
         load_env()
+        try:
+            from walkman import apply_listen_credentials
+            apply_listen_credentials(self.config.internal_root, self.config.sd_root)
+        except Exception:
+            pass
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         if self.state is None:
             self.state = State.load(STATE_DIR / "state.json")
+        if self.state.migrate_legacy_device_snapshot(self.config.device_id):
+            try:
+                self.state.save()
+            except OSError:
+                pass
         if self.cache is None:
             self.cache = TagCache.load(STATE_DIR / "tagcache.json")
         if self.lastfm is None:
@@ -82,7 +92,10 @@ class Session:
 
     def sign_in(self, username: str, password: str) -> str:
         if self.lastfm is None:
-            raise RuntimeError("Last.fm API key and secret are not set in .env")
+            raise RuntimeError(
+                "Last.fm API key and secret are not set on the Walkman "
+                "(listen_sources.conf) or in .env"
+            )
         name, key = self.lastfm.authenticate(username, password)
         from .config import save_env_value
         save_env_value("LASTFM_USERNAME", name)

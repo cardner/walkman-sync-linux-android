@@ -2,8 +2,8 @@
 
 Deliberately separate from `sync.py`'s `AppConfig`: this component is standalone — it runs on its
 own (`python -m likesync`), it can run when no music sync is planned, and it must not drag in the
-copy planner. It reads the same `.env` for Last.fm credentials so there is one place to sign in,
-and it keeps its own `likesync.json` for the settings only it has.
+copy planner. Last.fm credentials come from the Walkman's `listen_sources.conf` when present,
+otherwise the same `.env` as `sync.py`. Settings only this package has live in `likesync.json`.
 """
 from __future__ import annotations
 
@@ -56,68 +56,21 @@ def save_env_value(key: str, value: str, path: Path = ENV_PATH) -> None:
 
 # ───────────────────────────────────────────────────────── drive detection
 
-def _iter_windows_drives() -> list[str]:
-    import ctypes
-    drives: list[str] = []
-    mask = ctypes.windll.kernel32.GetLogicalDrives()   # type: ignore[attr-defined]
-    for index in range(26):
-        if mask & (1 << index):
-            drives.append(f"{chr(65 + index)}:\\")
-    return drives
-
-
-def _volume_label(drive_root: str) -> str:
-    import ctypes
-    from ctypes import wintypes
-    name = ctypes.create_unicode_buffer(261)
-    filesystem = ctypes.create_unicode_buffer(261)
-    serial, max_comp, flags = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD()
-    ok = ctypes.windll.kernel32.GetVolumeInformationW(   # type: ignore[attr-defined]
-        ctypes.c_wchar_p(drive_root), name, len(name), ctypes.byref(serial),
-        ctypes.byref(max_comp), ctypes.byref(flags), filesystem, len(filesystem))
-    return name.value.strip() if ok else ""
-
-
-def detect_walkman_roots() -> tuple[str, str]:
-    """(internal_root, sd_root) — the *drive* roots, not the Music folders.
-
-    The liked list, the loved export and the import file all live at the drive root next to
-    `.scrobbler.log`, because that is where Cinder writes them (`/contents/...` is the root of
-    the volume Windows mounts). Overridable for testing outside Windows.
-    """
-    internal = os.environ.get("LIKESYNC_INTERNAL", "")
-    sd = os.environ.get("LIKESYNC_SD", "")
-    if internal or sd:
-        return internal, sd
-    if os.name != "nt":
-        return "", ""
-
-    internal, sd = "D:\\", "E:\\"
-    candidates: list[tuple[str, str, int]] = []
-    import shutil
-    for drive in _iter_windows_drives():
-        try:
-            total = shutil.disk_usage(drive).total
-        except OSError:
-            continue
-        candidates.append((drive, _volume_label(drive), total))
-
-    walkman = next((d for d, label, _ in candidates if label.upper() == "WALKMAN"), None)
-    if walkman:
-        internal = walkman
-    card = next((d for d, label, total in candidates
-                 if d != walkman and (label.upper() == "32 GB" or 28 * 1024**3 <= total <= 36 * 1024**3)), None)
-    if card:
-        sd = card
-    return internal, sd
+def detect_walkman_roots(*, use_env: bool = True) -> tuple[str, str]:
+    """(internal_root, sd_root) — the *drive* roots, not the Music folders."""
+    try:
+        from walkman import detect_walkman_roots as shared
+        return shared(use_env=use_env)
+    except Exception:
+        return os.environ.get("LIKESYNC_INTERNAL", ""), os.environ.get("LIKESYNC_SD", "")
 
 
 # ───────────────────────────────────────────────────────── settings
 
 @dataclass
 class LikesConfig:
-    source_dir: str = r"C:\Users\ABDPa\Music\my music lossless"
-    playlist_dir: str = r"C:\Users\ABDPa\Music\Exported Playlists"
+    source_dir: str = r"\\WillineauVault\Music"
+    playlist_dir: str = r"\\WillineauVault\Music"
     internal_root: str = ""
     sd_root: str = ""
     # MusicBee hands its loves over as an exported playlist: point MusicBee at a playlist
@@ -132,7 +85,10 @@ class LikesConfig:
     # Conflict rule when a track was liked in one place and unliked in another since the last
     # run. "liked" keeps it (nothing is ever silently lost); "latest" trusts the newest change.
     conflict: str = "liked"
-    # Emit the liked playlist onto each device drive, listing that drive's liked tracks.
+    dest: str = "auto"
+    # Volume serial of the active Walkman; keys the likes device snapshot.
+    device_id: str = ""
+    # Emit the liked playlist onto the dest drive only (music sync's single destination).
     device_playlist: bool = True
     # Write cinder_liked_import.tsv so the on-device heart matches (needs Cinder >= the
     # liked-import build; harmless on older ones, which simply ignore the file).
@@ -156,10 +112,55 @@ class LikesConfig:
             override = os.environ.get(env_key, "")
             if override:
                 setattr(config, attribute, override)
-        if not config.internal_root or not config.sd_root:
-            internal, sd = detect_walkman_roots()
-            config.internal_root = config.internal_root or internal
-            config.sd_root = config.sd_root or sd
+        try:
+            from walkman import resolve_library_path
+            config.source_dir = resolve_library_path(config.source_dir)
+            config.playlist_dir = resolve_library_path(config.playlist_dir)
+        except Exception:
+            pass
+        internal, sd = detect_walkman_roots(use_env=True)
+        try:
+            from walkman import (
+                KIND_ANDROID, SyncSettings, bind_live_device, detect_walkman_paths,
+                infer_device_kind, volume_root,
+            )
+            from storage import detect_android_mounts, is_remote
+            settings = SyncSettings.load()
+            android = settings.device_kind == KIND_ANDROID
+            music_internal, music_sd = detect_walkman_paths(use_env=False, android=android)
+            if not music_internal and not music_sd:
+                remote_internal, remote_sd = detect_android_mounts()
+                if remote_internal or remote_sd:
+                    music_internal, music_sd = remote_internal, remote_sd
+            if music_internal or music_sd:
+                inferred = infer_device_kind(
+                    music_internal if is_remote(music_internal) else (internal or ""),
+                    music_sd if is_remote(music_sd) else (sd or ""),
+                )
+                bind_live_device(settings, music_internal, music_sd, inferred_kind=inferred)
+                internal = volume_root(settings.internal_drive) if settings.internal_drive else internal
+                sd = volume_root(settings.sd_drive) if settings.sd_drive else sd
+            if settings.device_kind == KIND_ANDROID:
+                config.device_import = False
+            if not config.dest or config.dest == "auto":
+                config.dest = settings.dest or config.dest
+            config.device_id = settings.active_device
+            if not internal and not sd:
+                internal = volume_root(settings.internal_drive) if settings.internal_drive else ""
+                sd = volume_root(settings.sd_drive) if settings.sd_drive else ""
+        except Exception:
+            pass
+        if internal:
+            config.internal_root = internal
+        if sd:
+            config.sd_root = sd
+        elif internal:
+            config.sd_root = sd
+        try:
+            from walkman import apply_listen_credentials
+            apply_listen_credentials(config.internal_root, config.sd_root)
+        except Exception:
+            pass
         return config
 
     def save(self, path: Path = SETTINGS_PATH) -> None:
@@ -167,9 +168,17 @@ class LikesConfig:
 
     @property
     def device_roots(self) -> list[str]:
-        return [root for root in (self.internal_root, self.sd_root) if root and os.path.isdir(root)]
+        try:
+            from storage import isdir
+        except Exception:
+            isdir = os.path.isdir
+        return [root for root in (self.internal_root, self.sd_root) if root and isdir(root)]
 
     @property
     def lastfm_ready(self) -> bool:
         return all(os.environ.get(key, "").strip() for key in
                    ("LASTFM_API_KEY", "LASTFM_API_SECRET", "LASTFM_SESSION_KEY"))
+
+    @property
+    def device_snapshot_key(self) -> str:
+        return f"device:{self.device_id}" if self.device_id else "device"

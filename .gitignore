@@ -2,3 +2,5 @@
 /__pycache__
 /.likesync/
 /likesync.json
+/target
+**/*.rs.bk

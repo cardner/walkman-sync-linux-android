@@ -1,0 +1,43 @@
+{
+  "source_dir": "\\\\WillineauVault\\Music",
+  "playlist_dir": "\\\\WillineauVault\\Music",
+  "excluded_albums": "",
+  "copy_workers": 1,
+  "auto_detect_drives": true,
+  "active_device": "adb-001045c585006296",
+  "devices": {
+    "426117e5": {
+      "name": "WALKMAN",
+      "internal_serial": "426117e5",
+      "sd_serial": "23b21ab1",
+      "internal_drive": "F:\\MUSIC",
+      "sd_drive": "G:\\MUSIC",
+      "dest": "auto",
+      "device_kind": "cinder",
+      "internal_max_gb": 0.0,
+      "sd_max_gb": 0.0
+    },
+    "adb-001045c585006296": {
+      "name": "Walkman 3",
+      "internal_serial": "adb-001045c585006296",
+      "sd_serial": "adb-001045c585006296",
+      "internal_drive": "adb://001045c585006296/sdcard/Music",
+      "sd_drive": "adb://001045c585006296/storage/75D7-DC5F/Music",
+      "dest": "auto",
+      "device_kind": "android-walkman",
+      "internal_max_gb": 0.0,
+      "sd_max_gb": 0.0
+    },
+    "mtp-WALKMAN": {
+      "name": "WALKMAN 2",
+      "internal_serial": "mtp-WALKMAN",
+      "sd_serial": "mtp-WALKMAN",
+      "internal_drive": "mtp://WALKMAN/Internal shared storage/Music",
+      "sd_drive": "mtp://WALKMAN/SlvrWalkman/Music",
+      "dest": "auto",
+      "device_kind": "android-walkman",
+      "internal_max_gb": 0.0,
+      "sd_max_gb": 0.0
+    }
+  }
+}

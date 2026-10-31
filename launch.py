@@ -1,0 +1,12 @@
+"""Retired. Walkman Sync is the walkman-sync binary (no Python runtime)."""
+import sys
+
+print("Walkman Sync is now the walkman-sync binary — no Python runtime.", file=sys.stderr)
+print("  cargo build --release", file=sys.stderr)
+print("  target/release/walkman-sync --install-shortcut", file=sys.stderr)
+print("  target/release/walkman-sync", file=sys.stderr)
+print(
+    "Helper scripts audit_scrobbles.py / paste_lastfm.py / tracklist_scrobbler.py still use Python.",
+    file=sys.stderr,
+)
+sys.exit(1)

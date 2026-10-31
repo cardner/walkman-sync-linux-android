@@ -71,6 +71,7 @@ def build_fixture(tmp: str) -> sync.AppConfig:
 
     return sync.AppConfig(source_dir=source, playlist_dir=playlists,
                           internal_drive=internal, sd_drive=sd,
+                          dest="internal",
                           internal_max_gb=1, sd_max_gb=1)
 
 
@@ -128,6 +129,8 @@ class TestListView(unittest.TestCase):
 class TestScreens(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        self._prev_catalog = os.environ.get("SONY_SYNC_CATALOG")
+        os.environ["SONY_SYNC_CATALOG"] = os.path.join(self.tmp.name, "catalog.sqlite")
         self.config = build_fixture(self.tmp.name)
         self.app = app_mod.App()
         self.app.config = self.config
@@ -135,6 +138,10 @@ class TestScreens(unittest.TestCase):
         self.app.report = sync.build_scan_report(self.config)
 
     def tearDown(self) -> None:
+        if self._prev_catalog is None:
+            os.environ.pop("SONY_SYNC_CATALOG", None)
+        else:
+            os.environ["SONY_SYNC_CATALOG"] = self._prev_catalog
         self.tmp.cleanup()
 
     def test_dashboard_renders_and_fits(self) -> None:
@@ -147,6 +154,8 @@ class TestScreens(unittest.TestCase):
         self.assertIn("WALKMAN SYNC", text)
         self.assertIn("Storage", text)
         self.assertIn("Likes", text)
+        self.assertIn("AudioMuse", text)
+        self.assertIn("Library index", text)
 
     def test_dashboard_fits_a_small_terminal(self) -> None:
         """60x20 is the floor `Screen.size` clamps to; nothing may spill past it."""
@@ -188,6 +197,31 @@ class TestScreens(unittest.TestCase):
         self.assertIn("3/10", text)
         self.assertIn("00:42", text)
         self.assertIn("copying something.flac", text)
+
+    def test_task_screen_shows_dest_worker_rows(self) -> None:
+        progress = app_mod.TaskProgress()
+        progress.begin_copy("SD card", 3 * 1024 * 1024 * 1024)
+        progress.report_copy(1200 * 1024 * 1024, 3 * 1024 * 1024 * 1024, 18 * 1024 * 1024, "SD card")
+        progress.set_worker("dest", "SD card", "Teal.flac", 28 * 1024 * 1024, 41 * 1024 * 1024)
+        progress.step(1, 10, "Syncing Teal.flac")
+        lines = app_mod.render_task(self.app.screen, "Syncing", progress, frame=0)
+        text = "\n".join(lines)
+        self.assertIn("SD card", text)
+        self.assertIn("Teal.flac", text)
+        self.assertIn("GB", text)
+
+    def test_two_dest_writer_slots_only_when_workers_gt_1(self) -> None:
+        progress = app_mod.TaskProgress()
+        progress.begin_copy("Internal", 80 * 1024 * 1024)
+        progress.report_copy(10 * 1024 * 1024, 80 * 1024 * 1024, 8 * 1024 * 1024, "Internal")
+        progress.set_worker("dest-0", "Internal", "One.flac", 4 * 1024 * 1024, 10 * 1024 * 1024)
+        progress.set_worker("dest-1", "Internal", "Two.flac", 6 * 1024 * 1024, 12 * 1024 * 1024)
+        lines = app_mod.render_task(self.app.screen, "Syncing", progress, frame=0)
+        text = "\n".join(lines)
+        self.assertIn("One.flac", text)
+        self.assertIn("Two.flac", text)
+        self.assertNotIn("SD card", text)
+        self.assertEqual(text.count("Internal"), 3)  # heading + two worker rows
 
     def test_result_rows_include_the_activity_log(self) -> None:
         result = sync.sync_library(self.config, dry_run=True)
