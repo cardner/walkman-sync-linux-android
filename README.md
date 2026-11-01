@@ -72,6 +72,24 @@ tool. Last.fm and MusicBee likes still land as the **Liked Songs** playlist.
 
 ---
 
+## Stock Walkmans (NW-WM1A first)
+
+Settings ▸ **Device** `stock` (alias `wm1a`) is a non-Cinder mass-storage player. The NW-WM1A is the one this path is written for. NW-A55, ZX300, and WM1Z use the same code later; they do not have their own checks yet.
+
+A volume with `DevIcon.fil` or `DevLogo.fil` and no Cinder files is `stock`. Cinder files still win. `.scrobbler.log` does not select a kind. A card that only has `MUSIC` does not downgrade a saved `stock` or `cinder` profile.
+
+On `stock`:
+
+* music goes in `MUSIC/`;
+* library playlists and AudioMuse mixes are relative `.m3u` files in that folder (`Mix.m3u8` is written as `Mix.m3u`). `cinder_playlists/` is not written;
+* likes round-trip through `MUSIC/Liked Songs.m3u`. That is a playlist, not a bookmark heart. A missing file does not unlike anything. A file that still matches the last write does not unlike anything either;
+* AudioMuse scores are not written. The WM1A has no Channels screen;
+* plays upload from `.scrobbler.log` at the internal volume root. Stock firmware does not create that file. The on-device recorder is a separate package and is not installed by Walkman Sync. Plug in the player itself; a card in a reader does not carry the log.
+
+After a copy, unplug and let the player rebuild its library.
+
+---
+
 ## Several Walkmans, one library
 
 The source library and album exclusions are shared. Each plugged player is its own profile,

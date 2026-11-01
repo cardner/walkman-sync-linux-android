@@ -78,6 +78,12 @@ impl AppConfig {
     pub fn is_android(&self) -> bool {
         self.settings.device_kind() == walkman::KIND_ANDROID
     }
+    pub fn is_cinder(&self) -> bool {
+        self.settings.device_kind() == walkman::KIND_CINDER
+    }
+    pub fn is_stock(&self) -> bool {
+        self.settings.device_kind() == walkman::KIND_STOCK
+    }
     pub fn dest_is_connected(&self) -> bool {
         let d = self.dest_drive();
         !d.is_empty() && storage::isdir(&d)
@@ -1375,14 +1381,25 @@ pub fn write_playlist_files(config: &AppConfig, plan: &LibraryPlan) {
     let dest = config.dest_drive();
     for (name, tracks) in &plan.playlist {
         let drive = plan.playlist_drive.get(name).unwrap_or(&dest);
-        let path = storage::join(drive, &[name]);
+        let file_name = if config.is_stock() {
+            walkman::stock_m3u_name(name)
+        } else {
+            name.clone()
+        };
+        let path = storage::join(drive, &[&file_name]);
         let mut body = String::from("#EXTM3U\n");
         for t in tracks {
             body.push_str(&t.replace('\\', "/"));
             body.push('\n');
         }
         let _ = storage::write_text(&path, &body);
-        if !config.is_android() {
+        if config.is_stock() {
+            let sibling = storage::join(drive, &[name]);
+            if storage::fold_path(&sibling) != storage::fold_path(&path) {
+                let _ = storage::remove(&sibling);
+            }
+        }
+        if config.is_cinder() {
             let root = walkman::volume_root(drive);
             let cinder = storage::join(&root, &["cinder_playlists", name]);
             let prefix = if config.dest_is_internal() {
@@ -1551,6 +1568,14 @@ pub struct ScrobbleFile {
     pub pending: usize,
 }
 
+pub fn missing_scrobble_message(stock: bool) -> &'static str {
+    if stock {
+        "Stock firmware does not record plays. A .scrobbler.log at the internal volume root is uploaded."
+    } else {
+        "No scrobble log on the Walkman."
+    }
+}
+
 pub fn list_scrobble_files(config: &AppConfig) -> Vec<ScrobbleFile> {
     let mut files = Vec::new();
     for root in [config.internal_drive(), config.sd_drive()] {
@@ -1562,11 +1587,7 @@ pub fn list_scrobble_files(config: &AppConfig) -> Vec<ScrobbleFile> {
             let path = storage::join(&vol, &[name]);
             if storage::exists(&path) {
                 let pending = storage::read_text(&path)
-                    .map(|t| {
-                        t.lines()
-                            .filter(|l| !l.starts_with('#') && !l.is_empty())
-                            .count()
-                    })
+                    .map(|t| crate::likes::count_uploadable_scrobbles(&t))
                     .unwrap_or(0);
                 files.push(ScrobbleFile { path, pending });
             }
@@ -1583,7 +1604,7 @@ pub fn upload_scrobbles(config: &AppConfig) -> SyncResult {
     }
     let files = list_scrobble_files(config);
     if files.is_empty() {
-        result.log("No scrobble log on the Walkman.");
+        result.log(missing_scrobble_message(config.is_stock()));
         return result;
     }
     for file in files {
@@ -1915,5 +1936,51 @@ mod tests {
         let folded: Vec<String> = tracks.iter().map(|t| storage::fold_rel(t)).collect();
         let want = storage::fold_rel(&sep(&["Kept", "a.flac"]));
         assert!(folded.iter().all(|t| t == &want), "{folded:?}");
+    }
+
+    fn test_config(dest: &str, kind: &str) -> AppConfig {
+        let mut settings = crate::walkman::SyncSettings::default();
+        settings.auto_detect_drives = false;
+        settings.active_device = "wm".into();
+        settings.devices.insert(
+            "wm".into(),
+            crate::walkman::DeviceProfile {
+                name: "WM1A".into(),
+                internal_drive: dest.to_string(),
+                dest: "internal".into(),
+                device_kind: kind.to_string(),
+                ..crate::walkman::DeviceProfile::default()
+            },
+        );
+        AppConfig {
+            settings,
+            lastfm_api_key: String::new(),
+            lastfm_api_secret: String::new(),
+            lastfm_username: String::new(),
+            lastfm_session_key: String::new(),
+            audiomuse_url: String::new(),
+            audiomuse_token: String::new(),
+            new_walkman: String::new(),
+        }
+    }
+
+    #[test]
+    fn stock_playlist_is_relative_m3u_without_cinder_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("MUSIC");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("Mix.m3u8"), "old").unwrap();
+        let dest_s = dest.to_string_lossy().into_owned();
+        let mut plan = LibraryPlan::default();
+        plan.playlist
+            .insert("Mix.m3u8".into(), vec!["Artist/Album/01.flac".into()]);
+        plan.playlist_drive.insert("Mix.m3u8".into(), dest_s.clone());
+        let config = test_config(&dest_s, crate::walkman::KIND_STOCK);
+        write_playlist_files(&config, &plan);
+        let body = fs::read_to_string(dest.join("Mix.m3u")).unwrap();
+        assert!(body.contains("Artist/Album/01.flac"), "{body}");
+        assert!(!body.contains("/MUSIC/"), "{body}");
+        assert!(!dest.join("Mix.m3u8").exists());
+        assert!(!tmp.path().join("cinder_playlists").exists());
     }
 }

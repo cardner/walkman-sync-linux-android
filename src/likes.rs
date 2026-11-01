@@ -13,12 +13,13 @@ use crate::catalog::{self, Catalog};
 use crate::keys as audio_keys;
 use crate::paths;
 use crate::storage;
-use crate::walkman::{self, KIND_ANDROID};
+use crate::walkman::{self, KIND_ANDROID, KIND_STOCK};
 
 pub const STATE_VERSION: u32 = 2;
 pub const DEVICE_LOVED_TSV: &str = "cinder_loved.tsv";
 pub const DEVICE_IMPORT_TSV: &str = "cinder_liked_import.tsv";
 pub const LIKED_PLAYLIST: &str = "Liked Songs.m3u8";
+pub const STOCK_LIKED_PLAYLIST: &str = "Liked Songs.m3u";
 pub const IMPORT_HEADER: &str = "# artist\ttitle — liked list pushed from the PC (likesync).\n# Cinder replaces cinder_liked.conf on the next start and renames this file .done.\n";
 const UNIT: char = '\u{241F}';
 const LASTFM_URL: &str = "https://ws.audioscrobbler.com/2.0/";
@@ -196,6 +197,10 @@ pub struct State {
     pub last_sync: f64,
     #[serde(default = "state_version")]
     pub version: u32,
+    /// Relative paths last written to each stock volume's Liked Songs.m3u.
+    /// Keyed `stock:<device id>:<internal|sd>`.
+    #[serde(default)]
+    pub stock_playlist_paths: BTreeMap<String, Vec<String>>,
 }
 
 fn state_version() -> u32 {
@@ -210,6 +215,7 @@ impl Default for State {
             liked: BTreeMap::new(),
             last_sync: 0.0,
             version: STATE_VERSION,
+            stock_playlist_paths: BTreeMap::new(),
         }
     }
 }
@@ -233,6 +239,7 @@ impl State {
         state.liked = data.liked;
         state.last_sync = data.last_sync;
         state.version = data.version;
+        state.stock_playlist_paths = data.stock_playlist_paths;
         state
     }
 
@@ -306,6 +313,8 @@ pub struct LikesConfig {
     pub device_playlist: bool,
     #[serde(default = "default_true")]
     pub device_import: bool,
+    #[serde(default)]
+    pub device_kind: String,
 }
 
 fn default_source() -> String {
@@ -337,6 +346,7 @@ impl Default for LikesConfig {
             device_id: String::new(),
             device_playlist: true,
             device_import: true,
+            device_kind: String::new(),
         }
     }
 }
@@ -352,7 +362,8 @@ impl LikesConfig {
         config.source_dir = walkman::resolve_library_path(&config.source_dir);
         config.playlist_dir = walkman::resolve_library_path(&config.playlist_dir);
         let settings = walkman::SyncSettings::load();
-        if settings.device_kind() == KIND_ANDROID {
+        config.device_kind = settings.device_kind();
+        if config.device_kind == KIND_ANDROID || config.device_kind == KIND_STOCK {
             config.device_import = false;
         }
         if config.dest.is_empty() || config.dest == "auto" {
@@ -383,6 +394,10 @@ impl LikesConfig {
             format!("device:{}", self.device_id)
         }
     }
+
+    pub fn is_stock(&self) -> bool {
+        self.device_kind == KIND_STOCK
+    }
 }
 
 // ── library index ──────────────────────────────────────────────
@@ -396,6 +411,10 @@ pub struct Entry {
     pub track_no: i32,
 }
 
+fn rel_key(rel: &str) -> String {
+    rel.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LibraryIndex {
     pub source_dir: String,
@@ -403,6 +422,7 @@ pub struct LibraryIndex {
     by_key: HashMap<String, usize>,
     by_loose: HashMap<String, usize>,
     by_folder: HashMap<String, usize>,
+    by_rel: HashMap<String, usize>,
 }
 
 impl LibraryIndex {
@@ -459,7 +479,16 @@ impl LibraryIndex {
         self.by_folder
             .entry(format!("{}{UNIT}{}", folder_artist.to_lowercase(), norm_title(&entry.title)))
             .or_insert(idx);
+        self.by_rel
+            .entry(rel_key(&entry.rel_path))
+            .or_insert(idx);
         self.entries.push(entry);
+    }
+
+    pub fn by_rel_path(&self, rel: &str) -> Option<&Entry> {
+        self.by_rel
+            .get(&rel_key(rel))
+            .and_then(|&i| self.entries.get(i))
     }
 
     pub fn resolve(&self, artist: &str, title: &str) -> Option<&Entry> {
@@ -488,6 +517,7 @@ pub struct DeviceVolume {
     pub root: String,
     pub label: String,
     android: bool,
+    stock: bool,
 }
 
 impl DeviceVolume {
@@ -517,8 +547,15 @@ impl DeviceVolume {
     pub fn import_path(&self) -> String {
         storage::join(&self.root, &[DEVICE_IMPORT_TSV])
     }
+    pub fn liked_playlist_name(&self) -> &'static str {
+        if self.stock {
+            STOCK_LIKED_PLAYLIST
+        } else {
+            LIKED_PLAYLIST
+        }
+    }
     pub fn playlist_path(&self) -> String {
-        storage::join(&self.music_dir(), &[LIKED_PLAYLIST])
+        storage::join(&self.music_dir(), &[self.liked_playlist_name()])
     }
     pub fn present(&self) -> bool {
         !self.root.is_empty() && storage::isdir(&self.root)
@@ -542,7 +579,13 @@ impl DeviceVolume {
 }
 
 pub fn volumes(internal_root: &str, sd_root: &str) -> Vec<DeviceVolume> {
-    let android = walkman::SyncSettings::load().device_kind() == KIND_ANDROID;
+    let kind = walkman::SyncSettings::load().device_kind();
+    volumes_of(internal_root, sd_root, &kind)
+}
+
+fn volumes_of(internal_root: &str, sd_root: &str, kind: &str) -> Vec<DeviceVolume> {
+    let android = kind == KIND_ANDROID;
+    let stock = kind == KIND_STOCK;
     let mut found = Vec::new();
     for (root, label) in [(internal_root, "internal"), (sd_root, "sd")] {
         if !root.is_empty() {
@@ -550,10 +593,23 @@ pub fn volumes(internal_root: &str, sd_root: &str) -> Vec<DeviceVolume> {
                 root: root.to_string(),
                 label: label.to_string(),
                 android,
+                stock,
             });
         }
     }
     found
+}
+
+fn config_volumes(config: &LikesConfig) -> Vec<DeviceVolume> {
+    let kind = if config.device_kind.is_empty() {
+        walkman::SyncSettings::load().device_kind()
+    } else {
+        config.device_kind.clone()
+    };
+    volumes_of(&config.internal_root, &config.sd_root, &kind)
+        .into_iter()
+        .filter(|v| v.present())
+        .collect()
 }
 
 fn read_loved(volume: &DeviceVolume) -> BTreeMap<String, TrackMeta> {
@@ -628,7 +684,89 @@ fn write_device_playlist(volume: &DeviceVolume, rel_paths: &[String], dry_run: b
         body.push('\n');
     }
     let _ = storage::write_text(&volume.playlist_path(), &body);
+    if volume.stock {
+        let sibling = storage::join(&volume.music_dir(), &[LIKED_PLAYLIST]);
+        if storage::fold_path(&sibling) != storage::fold_path(&volume.playlist_path()) {
+            let _ = storage::remove(&sibling);
+        }
+    }
     rel_paths.len()
+}
+
+fn stock_playlist_key(device_id: &str, label: &str) -> String {
+    let id = if device_id.is_empty() { "device" } else { device_id };
+    format!("stock:{id}:{label}")
+}
+
+fn m3u_track_paths(text: &str) -> Vec<String> {
+    let mut paths: Vec<String> = text
+        .lines()
+        .map(|line| line.trim().trim_matches('"'))
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.replace('\\', "/"))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+struct StockRead {
+    tracks: BTreeMap<String, TrackMeta>,
+    matched_last_write: bool,
+}
+
+fn read_stock_likes(
+    config: &LikesConfig,
+    vols: &[DeviceVolume],
+    index: &LibraryIndex,
+    state: &State,
+) -> Option<StockRead> {
+    let mut saw = false;
+    let mut all_match = true;
+    let mut resolved = BTreeMap::new();
+    for volume in vols {
+        let path = volume.playlist_path();
+        if !storage::exists(&path) {
+            continue;
+        }
+        let Ok(text) = storage::read_text(&path) else {
+            continue;
+        };
+        saw = true;
+        let paths = m3u_track_paths(&text);
+        let stored = state
+            .stock_playlist_paths
+            .get(&stock_playlist_key(&config.device_id, &volume.label));
+        if stored.map(Vec::as_slice) != Some(paths.as_slice()) {
+            all_match = false;
+        }
+        for rel in &paths {
+            if let Some(entry) = index.by_rel_path(rel) {
+                resolved.insert(
+                    track_key(&entry.artist, &entry.title),
+                    TrackMeta {
+                        artist: entry.artist.clone(),
+                        title: entry.title.clone(),
+                        when: 0,
+                    },
+                );
+            }
+        }
+    }
+    if !saw {
+        return None;
+    }
+    let snap_name = config.device_snapshot_key();
+    if all_match && state.snapshots.contains_key(&snap_name) {
+        return Some(StockRead {
+            tracks: state.snapshot(&snap_name).keys,
+            matched_last_write: true,
+        });
+    }
+    Some(StockRead {
+        tracks: resolved,
+        matched_last_write: false,
+    })
 }
 
 fn remove_playlist(volume: &DeviceVolume, dry_run: bool) -> bool {
@@ -1053,6 +1191,7 @@ pub fn gather(
     config: &LikesConfig,
     index: &LibraryIndex,
     lastfm: Option<&mut Lastfm>,
+    state: &State,
 ) -> BTreeMap<String, SourceView> {
     let mut views: BTreeMap<String, SourceView> = SOURCES
         .iter()
@@ -1067,10 +1206,7 @@ pub fn gather(
         })
         .collect();
 
-    let vols: Vec<DeviceVolume> = volumes(&config.internal_root, &config.sd_root)
-        .into_iter()
-        .filter(|v| v.present())
-        .collect();
+    let vols = config_volumes(config);
     if !vols.is_empty() && config.device_import {
         let view = views.get_mut("device").unwrap();
         view.available = true;
@@ -1083,6 +1219,20 @@ pub fn gather(
             view.note = "import still pending on the device".into();
         } else {
             view.note = format!("{} volume(s)", vols.len());
+        }
+    } else if !vols.is_empty() && config.is_stock() {
+        let view = views.get_mut("device").unwrap();
+        match read_stock_likes(config, &vols, index, state) {
+            None => view.note = "no Liked Songs.m3u".into(),
+            Some(read) => {
+                view.available = true;
+                view.tracks = read.tracks;
+                view.note = if read.matched_last_write {
+                    "playlist matches last write".into()
+                } else {
+                    "Liked Songs.m3u".into()
+                };
+            }
         }
     } else if !vols.is_empty() {
         views.get_mut("device").unwrap().note = "playlist only".into();
@@ -1236,10 +1386,7 @@ pub fn build_plan(
             s.enabled = false;
         }
     }
-    let vols: Vec<DeviceVolume> = volumes(&config.internal_root, &config.sd_root)
-        .into_iter()
-        .filter(|v| v.present())
-        .collect();
+    let vols = config_volumes(config);
     for volume in &vols {
         plan.playlist.insert(volume.root.clone(), Vec::new());
     }
@@ -1348,10 +1495,7 @@ pub fn apply_plan(
             ));
         }
     }
-    let vols: Vec<DeviceVolume> = volumes(&config.internal_root, &config.sd_root)
-        .into_iter()
-        .filter(|v| v.present())
-        .collect();
+    let vols = config_volumes(config);
     let tracks: Vec<TrackMeta> = plan.desired.values().cloned().collect();
     let device_sink = plan.sinks.get("device").cloned().unwrap_or_default();
     let device_needs = !device_sink.add.is_empty() || !device_sink.remove.is_empty();
@@ -1380,6 +1524,12 @@ pub fn apply_plan(
             let rel_paths = plan.playlist.get(&volume.root).cloned().unwrap_or_default();
             if is_dest && !rel_paths.is_empty() {
                 write_device_playlist(volume, &rel_paths, dry_run);
+                if volume.stock && !dry_run {
+                    state.stock_playlist_paths.insert(
+                        stock_playlist_key(&config.device_id, &volume.label),
+                        m3u_track_paths(&rel_paths.join("\n")),
+                    );
+                }
                 result.log(format!(
                     "Device: {} — {} track(s)",
                     volume.playlist_path(),
@@ -1485,7 +1635,12 @@ impl Session {
             self.index = Some(LibraryIndex::from_catalog(&self.config.source_dir));
         }
         status("Reading likes from device, Last.fm and MusicBee");
-        let views = gather(&self.config, self.index.as_ref().unwrap(), self.lastfm.as_mut());
+        let views = gather(
+            &self.config,
+            self.index.as_ref().unwrap(),
+            self.lastfm.as_mut(),
+            &self.state,
+        );
         let plan = build_plan(
             &self.config,
             self.index.as_ref().unwrap(),
@@ -1565,6 +1720,32 @@ pub fn parse_scrobbler_log(text: &str) -> (Vec<String>, Vec<ScrobbleEntry>) {
     (header, entries)
 }
 
+pub fn is_uploadable_scrobble(entry: &ScrobbleEntry) -> bool {
+    entry.source_flag.eq_ignore_ascii_case("L")
+        && !entry.artist.trim().is_empty()
+        && !entry.track.trim().is_empty()
+        && entry.timestamp != 0
+}
+
+pub fn count_uploadable_scrobbles(text: &str) -> usize {
+    let (_, entries) = parse_scrobbler_log(text);
+    entries.iter().filter(|entry| is_uploadable_scrobble(entry)).count()
+}
+
+fn scrobble_log_body(header: &[String], entries: &[ScrobbleEntry]) -> String {
+    let mut body = header.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    for entry in entries {
+        body.push_str(&format!(
+            "{}\t{}\t{}\t\t\t{}\t{}\n",
+            entry.artist, entry.album, entry.track, entry.source_flag, entry.timestamp
+        ));
+    }
+    body
+}
+
 pub fn upload_scrobbles(
     config: &crate::sync::AppConfig,
     dry_run: bool,
@@ -1579,7 +1760,7 @@ pub fn upload_scrobbles(
     };
     let files = crate::sync::list_scrobble_files(config);
     if files.is_empty() {
-        result.log("No scrobble log on the Walkman.");
+        result.log(crate::sync::missing_scrobble_message(config.is_stock()));
         return result;
     }
     for file in files {
@@ -1589,7 +1770,7 @@ pub fn upload_scrobbles(
         let (header, entries) = parse_scrobbler_log(&text);
         let listened: Vec<_> = entries
             .iter()
-            .filter(|e| e.source_flag.eq_ignore_ascii_case("L"))
+            .filter(|entry| is_uploadable_scrobble(entry))
             .cloned()
             .collect();
         result.log(format!("{}: {} pending", file.path, listened.len()));
@@ -1604,24 +1785,203 @@ pub fn upload_scrobbles(
             Ok((accepted, _)) => {
                 result.log(format!("uploaded {accepted}"));
                 let remaining: Vec<_> = entries
-                    .iter()
-                    .filter(|e| !e.source_flag.eq_ignore_ascii_case("L"))
-                    .cloned()
+                    .into_iter()
+                    .filter(|entry| !is_uploadable_scrobble(entry))
                     .collect();
-                let mut body = header.join("\n");
-                if !body.is_empty() {
-                    body.push('\n');
-                }
-                for e in remaining {
-                    body.push_str(&format!(
-                        "{}\t{}\t{}\t\t\t{}\t{}\n",
-                        e.artist, e.album, e.track, e.source_flag, e.timestamp
-                    ));
-                }
-                let _ = storage::write_text(&file.path, &body);
+                let _ = storage::write_text(&file.path, &scrobble_log_body(&header, &remaining));
             }
             Err(err) => result.log(format!("scrobble failed: {err}")),
         }
     }
     result
+}
+
+#[cfg(test)]
+mod stock_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::*;
+
+    fn index_with(rel: &str, artist: &str, title: &str) -> LibraryIndex {
+        let mut index = LibraryIndex::default();
+        index.add(Entry {
+            rel_path: rel.to_string(),
+            artist: artist.to_string(),
+            title: title.to_string(),
+            album: String::new(),
+            track_no: 1,
+        });
+        index
+    }
+
+    fn stock_config(root: &str) -> LikesConfig {
+        LikesConfig {
+            internal_root: root.to_string(),
+            device_kind: KIND_STOCK.into(),
+            device_import: false,
+            device_id: "wm1a".into(),
+            device_playlist: true,
+            dest: "internal".into(),
+            lastfm_enabled: false,
+            musicbee_export_playlist: false,
+            ..LikesConfig::default()
+        }
+    }
+
+    fn meta(artist: &str, title: &str) -> (String, TrackMeta) {
+        (
+            track_key(artist, title),
+            TrackMeta {
+                artist: artist.to_string(),
+                title: title.to_string(),
+                when: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn missing_m3u_does_not_unlike() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        fs::create_dir_all(Path::new(&root).join("MUSIC")).unwrap();
+        let config = stock_config(&root);
+        let index = index_with("Artist/01.flac", "Queen", "Night");
+        let (key, track) = meta("Queen", "Night");
+        let mut state = State::default();
+        state.liked.insert(key.clone(), track.clone());
+        state.set_snapshot(&config.device_snapshot_key(), state.liked.clone());
+        let views = gather(&config, &index, None, &state);
+        assert!(!views["device"].available);
+        let plan = build_plan(&config, &index, views, &state);
+        assert!(plan.desired.contains_key(&key));
+    }
+
+    #[test]
+    fn matching_last_write_is_not_a_device_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let music = root.join("MUSIC");
+        fs::create_dir_all(&music).unwrap();
+        fs::write(music.join("Liked Songs.m3u"), "#EXTM3U\nArtist/01.flac\n").unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let config = stock_config(&root_s);
+        let index = index_with("Artist/01.flac", "Queen", "Night");
+        let (key, track) = meta("Queen", "Night");
+        let mut state = State::default();
+        state.liked.insert(key.clone(), track.clone());
+        state.set_snapshot(&config.device_snapshot_key(), state.liked.clone());
+        state.stock_playlist_paths.insert(
+            stock_playlist_key(&config.device_id, "internal"),
+            vec!["Artist/01.flac".into()],
+        );
+        let views = gather(&config, &index, None, &state);
+        assert!(views["device"].available);
+        assert_eq!(views["device"].note, "playlist matches last write");
+        let plan = build_plan(&config, &index, views, &state);
+        let sink = &plan.sinks["device"];
+        assert!(sink.add.is_empty(), "{:?}", sink.add);
+        assert!(sink.remove.is_empty(), "{:?}", sink.remove);
+        assert!(plan.desired.contains_key(&key));
+    }
+
+    #[test]
+    fn changed_m3u_removes_a_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let music = root.join("MUSIC");
+        fs::create_dir_all(&music).unwrap();
+        fs::write(music.join("Liked Songs.m3u"), "#EXTM3U\nArtist/01.flac\n").unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let config = stock_config(&root_s);
+        let mut index = index_with("Artist/01.flac", "Queen", "Night");
+        index.add(Entry {
+            rel_path: "Artist/02.flac".into(),
+            artist: "Queen".into(),
+            title: "Day".into(),
+            album: String::new(),
+            track_no: 2,
+        });
+        let (keep, keep_meta) = meta("Queen", "Night");
+        let (drop, drop_meta) = meta("Queen", "Day");
+        let mut liked = std::collections::BTreeMap::new();
+        liked.insert(keep.clone(), keep_meta);
+        liked.insert(drop.clone(), drop_meta);
+        let mut state = State::default();
+        state.liked = liked.clone();
+        state.set_snapshot(&config.device_snapshot_key(), liked);
+        state.stock_playlist_paths.insert(
+            stock_playlist_key(&config.device_id, "internal"),
+            vec!["Artist/01.flac".into(), "Artist/02.flac".into()],
+        );
+        let views = gather(&config, &index, None, &state);
+        assert_eq!(views["device"].note, "Liked Songs.m3u");
+        let plan = build_plan(&config, &index, views, &state);
+        assert!(plan.desired.contains_key(&keep));
+        assert!(!plan.desired.contains_key(&drop));
+    }
+
+    #[test]
+    fn stock_write_is_m3u_and_skips_cinder_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("MUSIC")).unwrap();
+        fs::write(root.join("MUSIC").join("Liked Songs.m3u8"), "old").unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let config = stock_config(&root_s);
+        let mut state = State::default();
+        state.path = root.join("state.json");
+        let mut plan = Plan::default();
+        plan.playlist
+            .insert(root_s.clone(), vec!["Artist/01.flac".into()]);
+        plan.views.insert(
+            "device".into(),
+            SourceView {
+                name: "device".into(),
+                available: true,
+                ..SourceView::default()
+            },
+        );
+        apply_plan(&config, &plan, &mut state, None, false);
+        let body = fs::read_to_string(root.join("MUSIC").join("Liked Songs.m3u")).unwrap();
+        assert!(body.contains("Artist/01.flac"), "{body}");
+        assert!(!root.join("MUSIC").join("Liked Songs.m3u8").exists());
+        assert!(!root.join(DEVICE_IMPORT_TSV).exists());
+        let stored = state
+            .stock_playlist_paths
+            .get(&stock_playlist_key("wm1a", "internal"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(stored, vec!["Artist/01.flac".to_string()]);
+    }
+
+    #[test]
+    fn scrobble_log_uploads_listens_and_keeps_skips() {
+        let text = "\
+#AUDIOSCROBBLER/1.1
+#TZ/UTC
+Queen\tOpera\tNight\t1\t200\tL\t1700000000
+\tOpera\tBlank Artist\t1\t200\tL\t1700000001
+Queen\tOpera\t\t1\t200\tL\t1700000002
+Queen\tOpera\tZero\t1\t200\tL\t0
+Queen\tOpera\tSkipped\t1\t200\tS\t1700000003
+";
+        assert_eq!(count_uploadable_scrobbles(text), 1);
+        let (header, entries) = parse_scrobbler_log(text);
+        let uploadable: Vec<_> = entries
+            .iter()
+            .filter(|entry| is_uploadable_scrobble(entry))
+            .collect();
+        assert_eq!(uploadable.len(), 1);
+        assert_eq!(uploadable[0].track, "Night");
+        let remaining: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| !is_uploadable_scrobble(entry))
+            .collect();
+        let body = scrobble_log_body(&header, &remaining);
+        assert!(body.starts_with("#AUDIOSCROBBLER/1.1\n"), "{body}");
+        assert!(body.contains("Skipped"), "{body}");
+        assert!(body.contains("\tS\t"), "{body}");
+        assert!(!body.contains("Night"), "{body}");
+    }
 }

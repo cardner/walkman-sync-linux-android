@@ -57,6 +57,9 @@ pub struct PullResult {
     pub score_path: String,
     pub written: bool,
     pub logs: Vec<String>,
+    pub stock: bool,
+    pub stock_dir: String,
+    pub source_dir: String,
 }
 
 impl PullResult {
@@ -338,6 +341,58 @@ pub fn android_blocks_audiomuse(config: &AppConfig) -> bool {
     config.is_android()
 }
 
+pub fn stock_playlist_files(
+    mixes: &[Playlist],
+    lookup: &dyn Fn(&str, &str) -> Option<String>,
+) -> Vec<(String, String, usize)> {
+    let mut used = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    for mix in mixes {
+        let mut name = mix_filename(&mix.name);
+        let stem = name.trim_end_matches(".m3u").to_string();
+        let mut n = 2u32;
+        while !used.insert(name.to_ascii_lowercase()) {
+            name = format!("{stem}-{n}.m3u");
+            n += 1;
+        }
+        let mut paths = Vec::new();
+        let mut skipped = 0usize;
+        for track in mix.tracks.iter().take(MAX_TRACKS) {
+            match lookup(&track.artist, &track.title) {
+                Some(rel) if !rel.is_empty() => paths.push(rel.replace('\\', "/")),
+                _ => skipped += 1,
+            }
+        }
+        let mut body = String::from("#EXTM3U\n");
+        for path in &paths {
+            body.push_str(path);
+            body.push('\n');
+        }
+        files.push((name, body, skipped));
+    }
+    files
+}
+
+fn mix_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim();
+    let base = if cleaned.is_empty() { "Mix" } else { cleaned };
+    if base.to_ascii_lowercase().ends_with(".m3u") {
+        base.to_string()
+    } else {
+        format!("{base}.m3u")
+    }
+}
+
 pub fn prepare(config: &AppConfig, progress: &mut dyn FnMut(&str)) -> PullResult {
     let mut result = PullResult::default();
     if android_blocks_audiomuse(config) {
@@ -347,6 +402,9 @@ pub fn prepare(config: &AppConfig, progress: &mut dyn FnMut(&str)) -> PullResult
     if !configured(config) {
         result.skipped = "AudioMuse not configured".into();
         return result;
+    }
+    if config.is_stock() {
+        return prepare_stock(config, progress);
     }
     let dest = config.internal_drive();
     if dest.is_empty() || !storage::isdir(&dest) {
@@ -406,10 +464,45 @@ pub fn prepare(config: &AppConfig, progress: &mut dyn FnMut(&str)) -> PullResult
     result
 }
 
+fn prepare_stock(config: &AppConfig, progress: &mut dyn FnMut(&str)) -> PullResult {
+    let mut result = PullResult::default();
+    let dest = if config.dest_is_connected() {
+        config.dest_drive()
+    } else {
+        config.internal_drive()
+    };
+    if dest.is_empty() || !storage::isdir(&dest) {
+        result.error = "Walkman is not connected".into();
+        return result;
+    }
+    result.stock = true;
+    result.stock_dir = dest;
+    result.source_dir = config.source_dir();
+    let base = normalize_base(&config.audiomuse_url);
+    progress("Fetching AudioMuse playlists...");
+    match fetch(&format!("{base}/api/playlists"), &config.audiomuse_token) {
+        Ok(body) => match playlists_from_json(&body) {
+            Ok(mixes) => {
+                result.log(format!("{} mix(es)", mixes.len()));
+                result.mixes = mixes;
+            }
+            Err(err) => result.error = err,
+        },
+        Err(err) => result.error = err,
+    }
+    if result.error.is_empty() {
+        result.log("Channels scores were not written");
+    }
+    result
+}
+
 pub fn commit(preview: &PullResult, dry_run: bool) -> PullResult {
     let mut result = preview.clone();
     if !result.error.is_empty() || !result.skipped.is_empty() {
         return result;
+    }
+    if result.stock {
+        return commit_stock(result, dry_run);
     }
     if dry_run {
         result.log("dry run — nothing written");
@@ -429,6 +522,40 @@ pub fn commit(preview: &PullResult, dry_run: bool) -> PullResult {
         }
         result.log(format!("wrote {}", result.score_path));
     }
+    result.written = true;
+    result
+}
+
+fn commit_stock(mut result: PullResult, dry_run: bool) -> PullResult {
+    if dry_run {
+        result.log("dry run — nothing written");
+        result.log("Channels scores were not written");
+        return result;
+    }
+    let index = crate::likes::LibraryIndex::from_catalog(&result.source_dir);
+    let files = stock_playlist_files(&result.mixes, &|artist, title| {
+        index
+            .resolve(artist, title)
+            .map(|entry| entry.rel_path.replace('\\', "/"))
+    });
+    let mut skipped = 0usize;
+    for (name, body, miss) in files {
+        skipped += miss;
+        let path = storage::join(&result.stock_dir, &[&name]);
+        if let Err(err) = storage::write_text(&path, &body) {
+            result.error = err.to_string();
+            return result;
+        }
+        let sibling = storage::join(&result.stock_dir, &[&format!("{}.m3u8", name.trim_end_matches(".m3u"))]);
+        if storage::exists(&sibling) {
+            let _ = storage::remove(&sibling);
+        }
+        result.log(format!("wrote {path}"));
+    }
+    if skipped > 0 {
+        result.log(format!("{skipped} track(s) not on the Walkman"));
+    }
+    result.log("Channels scores were not written");
     result.written = true;
     result
 }
@@ -506,5 +633,37 @@ mod tests {
         let late = lists.iter().find(|item| item.name == "Late").unwrap();
         assert_eq!(late.tracks.len(), 1);
         assert_eq!(late.id, "am:Late_automatic");
+    }
+
+    #[test]
+    fn stock_mix_becomes_relative_m3u_and_skips_unknown_tracks() {
+        let mix = Playlist {
+            name: "Late".into(),
+            tracks: vec![
+                Track {
+                    artist: "Queen".into(),
+                    title: "Night".into(),
+                    album: "Opera".into(),
+                },
+                Track {
+                    artist: "Nope".into(),
+                    title: "Gone".into(),
+                    ..Track::default()
+                },
+            ],
+            ..Playlist::default()
+        };
+        let files = stock_playlist_files(&[mix], &|artist, title| {
+            if artist == "Queen" && title == "Night" {
+                Some("Queen/Opera/01.flac".into())
+            } else {
+                None
+            }
+        });
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "Late.m3u");
+        assert!(files[0].1.contains("Queen/Opera/01.flac"), "{}", files[0].1);
+        assert!(!files[0].1.contains("/MUSIC/"), "{}", files[0].1);
+        assert_eq!(files[0].2, 1);
     }
 }

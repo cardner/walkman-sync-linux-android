@@ -445,7 +445,7 @@ impl App {
         let files = sync::list_scrobble_files(&self.config);
         self.scrobble_pending = files.iter().map(|f| f.pending).sum();
         self.scrobble_note = if files.is_empty() {
-            "No scrobble log on the Walkman".into()
+            sync::missing_scrobble_message(self.config.is_stock()).into()
         } else {
             format!(
                 "{} log(s) · {} play(s) to upload",
@@ -676,7 +676,7 @@ impl App {
         if files.is_empty() {
             self.show_text(
                 "Scrobbles",
-                vec!["No scrobble log found on the Walkman.".into()],
+                vec![sync::missing_scrobble_message(self.config.is_stock()).into()],
             );
             return;
         }
@@ -788,16 +788,12 @@ impl App {
                 self.config.set_dest(&v);
             }
             "kind" => {
-                let mut v = answer.to_ascii_lowercase().replace(' ', "-");
-                if matches!(v.as_str(), "android" | "zx500" | "a100") {
-                    v = "android-walkman".into();
-                }
-                if !matches!(v.as_str(), "cinder" | "android-walkman") {
-                    self.toast = "use cinder or android-walkman".into();
+                let Some(v) = walkman::canonical_device_kind(&answer) else {
+                    self.toast = "use cinder, android-walkman, or stock".into();
                     self.screen = Screen::Settings;
                     return;
-                }
-                self.config.set_device_kind(&v);
+                };
+                self.config.set_device_kind(v);
             }
             "internal" => self.config.set_internal_drive(&answer),
             "sd" => self.config.set_sd_drive(&answer),
@@ -1429,7 +1425,7 @@ fn settings_fields(config: &AppConfig) -> Vec<(&'static str, &'static str)> {
         ("name", "Walkman name"),
         ("known", "Other Walkmans"),
         ("dest", "Destination (internal/sd/auto)"),
-        ("kind", "Device (cinder / android-walkman)"),
+        ("kind", "Device (cinder / android-walkman / stock)"),
         ("detect", "Walkman mounts"),
         ("internal", "Internal"),
         ("sd", "SD card"),

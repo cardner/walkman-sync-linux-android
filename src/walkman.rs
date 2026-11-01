@@ -18,12 +18,22 @@ pub const DEST_SD: &str = "sd";
 pub const DEST_AUTO: &str = "auto";
 pub const KIND_CINDER: &str = "cinder";
 pub const KIND_ANDROID: &str = "android-walkman";
+pub const KIND_STOCK: &str = "stock";
 pub const PENDING_DEVICE_ID: &str = "pending";
 pub const APP_TITLE: &str = "Walkman Sync";
 
 const DRIVE_REMOVABLE: u32 = 2;
-const WALKMAN_MARKERS: &[&str] = &[
-    ".scrobbler.log",
+const CINDER_MARKERS: &[&str] = &[
+    "cinder_loved.tsv",
+    "cinder_liked.conf",
+    "cinder_liked_import.tsv",
+    "listen_sources.conf",
+    "OMGAUDIO",
+];
+const STOCK_MARKERS: &[&str] = &["DevIcon.fil", "DevLogo.fil"];
+/// Files that identify a Sony volume. `.scrobbler.log` is not one of them: a
+/// WM1A recorder must not be classified as Cinder.
+const DETECT_MARKERS: &[&str] = &[
     "cinder_loved.tsv",
     "cinder_liked.conf",
     "cinder_liked_import.tsv",
@@ -598,17 +608,51 @@ pub fn has_music_folder(drive_root: &str) -> bool {
 }
 
 pub fn has_walkman_marker(path: &str) -> bool {
+    has_named_marker(path, DETECT_MARKERS)
+}
+
+fn has_named_marker(path: &str, names: &[&str]) -> bool {
     if path.is_empty() {
         return false;
     }
     for dir in marker_dirs(path) {
-        for name in WALKMAN_MARKERS {
+        for name in names {
             if storage::exists(&storage::join(&dir, &[name])) {
                 return true;
             }
         }
     }
     false
+}
+
+pub fn canonical_device_kind(raw: &str) -> Option<&'static str> {
+    let folded = raw.trim().to_ascii_lowercase().replace(' ', "-");
+    match folded.as_str() {
+        "cinder" => Some(KIND_CINDER),
+        "android" | "android-walkman" | "zx500" | "a100" => Some(KIND_ANDROID),
+        "stock" | "wm1a" => Some(KIND_STOCK),
+        _ => None,
+    }
+}
+
+pub fn stock_m3u_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".m3u8") {
+        return format!("{}.m3u", &name[..name.len() - 5]);
+    }
+    if lower.ends_with(".m3u") {
+        name.to_string()
+    } else {
+        format!("{name}.m3u")
+    }
+}
+
+fn kind_for_new_profile(inferred: &str) -> String {
+    match inferred {
+        KIND_ANDROID => KIND_ANDROID.into(),
+        KIND_STOCK => KIND_STOCK.into(),
+        _ => KIND_CINDER.into(),
+    }
 }
 
 fn marker_dirs(path: &str) -> Vec<String> {
@@ -643,8 +687,10 @@ pub fn evident_device_kind(internal_root: &str, sd_root: &str) -> Option<&'stati
     if mounted.is_empty() {
         return None;
     }
-    if mounted.iter().any(|path| has_walkman_marker(path)) {
+    if mounted.iter().any(|path| has_named_marker(path, CINDER_MARKERS)) {
         Some(KIND_CINDER)
+    } else if mounted.iter().any(|path| has_named_marker(path, STOCK_MARKERS)) {
+        Some(KIND_STOCK)
     } else {
         Some(KIND_ANDROID)
     }
@@ -866,6 +912,35 @@ pub fn default_device_name(internal_drive: &str, sd_drive: &str, existing: &[Str
     }
 }
 
+fn apply_evident_kind(
+    profile: &mut DeviceProfile,
+    internal: &str,
+    sd: &str,
+    created: bool,
+    inferred: &str,
+) {
+    match evident_device_kind(internal, sd) {
+        Some(KIND_CINDER) => profile.device_kind = KIND_CINDER.into(),
+        Some(KIND_STOCK) => {
+            if created || profile.device_kind != KIND_CINDER {
+                profile.device_kind = KIND_STOCK.into();
+            }
+        }
+        Some(KIND_ANDROID) => {
+            if created
+                || (profile.device_kind != KIND_STOCK && profile.device_kind != KIND_CINDER)
+            {
+                profile.device_kind = KIND_ANDROID.into();
+            }
+        }
+        _ => {
+            if created {
+                profile.device_kind = kind_for_new_profile(inferred);
+            }
+        }
+    }
+}
+
 pub fn bind_live_device(
     settings: &mut SyncSettings,
     internal_drive: &str,
@@ -914,11 +989,7 @@ pub fn bind_live_device(
             primary.clone(),
             DeviceProfile {
                 name: default_device_name(internal_drive, sd_drive, &names),
-                device_kind: if inferred_kind == KIND_ANDROID {
-                    KIND_ANDROID.into()
-                } else {
-                    KIND_CINDER.into()
-                },
+                device_kind: kind_for_new_profile(inferred_kind),
                 dest: DEST_AUTO.into(),
                 ..DeviceProfile::default()
             },
@@ -950,11 +1021,7 @@ pub fn bind_live_device(
         } else {
             profile.sd_drive.clear();
         }
-        if let Some(kind) = evident_device_kind(internal_drive, sd_drive) {
-            profile.device_kind = kind.to_string();
-        } else if created {
-            profile.device_kind = inferred_kind.to_string();
-        }
+        apply_evident_kind(profile, internal_drive, sd_drive, created, inferred_kind);
         before
     };
     if settings.devices.get(&key).map(|p| p.name.is_empty()).unwrap_or(false) {
@@ -1213,7 +1280,67 @@ mod kind_tests {
         fs::create_dir_all(root.join("MUSIC")).unwrap();
         fs::write(root.join("default-capability.xml"), "<c/>").unwrap();
         let music = root.join("MUSIC").to_string_lossy().into_owned();
+        assert_eq!(evident_device_kind(&music, ""), Some(KIND_ANDROID));
+    }
+
+    #[test]
+    fn devicon_without_cinder_files_is_stock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("MUSIC")).unwrap();
+        fs::write(root.join("DevIcon.fil"), "icon").unwrap();
+        fs::write(root.join(".sony-sync-serial"), "wm1a").unwrap();
+        let music = root.join("MUSIC").to_string_lossy().into_owned();
+        assert_eq!(evident_device_kind(&music, ""), Some(KIND_STOCK));
+        assert_eq!(infer_device_kind(&music, ""), KIND_STOCK);
+
+        let mut settings = SyncSettings::default();
+        bind_live_device(&mut settings, &music, "", KIND_STOCK);
+        assert_eq!(settings.device_kind(), KIND_STOCK);
+    }
+
+    #[test]
+    fn cinder_files_win_over_devicon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("MUSIC")).unwrap();
+        fs::write(root.join("DevIcon.fil"), "icon").unwrap();
+        fs::write(root.join("cinder_loved.tsv"), "a\tb\n").unwrap();
+        let music = root.join("MUSIC").to_string_lossy().into_owned();
         assert_eq!(evident_device_kind(&music, ""), Some(KIND_CINDER));
+    }
+
+    #[test]
+    fn scrobbler_log_alone_is_not_cinder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("MUSIC")).unwrap();
+        fs::write(root.join(".scrobbler.log"), "#AUDIOSCROBBLER/1.1\n").unwrap();
+        let music = root.join("MUSIC").to_string_lossy().into_owned();
+        assert_ne!(evident_device_kind(&music, ""), Some(KIND_CINDER));
+        assert_eq!(infer_device_kind(&music, ""), KIND_ANDROID);
+    }
+
+    #[test]
+    fn music_only_card_does_not_downgrade_stock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let card = tmp.path().join("card");
+        fs::create_dir_all(card.join("MUSIC")).unwrap();
+        fs::write(card.join(".sony-sync-serial"), "wm1a-sd").unwrap();
+        let music = card.join("MUSIC").to_string_lossy().into_owned();
+        let mut settings = SyncSettings::default();
+        settings.devices.insert(
+            "wm1a-sd".into(),
+            DeviceProfile {
+                name: "WM1A".into(),
+                device_kind: KIND_STOCK.into(),
+                sd_serial: "wm1a-sd".into(),
+                ..DeviceProfile::default()
+            },
+        );
+        settings.active_device = "wm1a-sd".into();
+        bind_live_device(&mut settings, "", &music, KIND_ANDROID);
+        assert_eq!(settings.device_kind(), KIND_STOCK);
     }
 }
 
