@@ -29,6 +29,9 @@ const WALKMAN_MARKERS: &[&str] = &[
     "cinder_liked_import.tsv",
     "listen_sources.conf",
     "OMGAUDIO",
+    "default-capability.xml",
+    "DevIcon.fil",
+    "DevLogo.fil",
 ];
 const SD_LABELS: &[&str] = &["32 GB", "SD", "SD CARD", "SD_CARD"];
 
@@ -594,40 +597,63 @@ pub fn has_music_folder(drive_root: &str) -> bool {
     Path::new(drive_root).join("MUSIC").is_dir() || Path::new(drive_root).join("Music").is_dir()
 }
 
-pub fn has_walkman_marker(drive_root: &str) -> bool {
-    let music = resolve_music_path(drive_root, false);
-    for name in WALKMAN_MARKERS {
-        if Path::new(drive_root).join(name).exists() || Path::new(&music).join(name).exists() {
-            return true;
+pub fn has_walkman_marker(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    for dir in marker_dirs(path) {
+        for name in WALKMAN_MARKERS {
+            if storage::exists(&storage::join(&dir, &[name])) {
+                return true;
+            }
         }
     }
     false
 }
 
+fn marker_dirs(path: &str) -> Vec<String> {
+    let mut dirs = vec![path.to_string()];
+    let leaf = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if leaf.eq_ignore_ascii_case("music") {
+        let parent = storage::parent(path);
+        if !parent.is_empty() && storage::fold_path(&parent) != storage::fold_path(path) {
+            dirs.push(parent);
+        }
+    }
+    dirs
+}
+
+fn volume_present(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    storage::isdir(path) || marker_dirs(path).iter().any(|dir| storage::isdir(dir))
+}
+
+/// Kind from files on a mounted volume. The volume label and the path
+/// (`D:\`, `adb://`, `mtp://`) are not evidence.
+pub fn evident_device_kind(internal_root: &str, sd_root: &str) -> Option<&'static str> {
+    let mounted: Vec<&str> = [internal_root, sd_root]
+        .into_iter()
+        .filter(|path| volume_present(path))
+        .collect();
+    if mounted.is_empty() {
+        return None;
+    }
+    if mounted.iter().any(|path| has_walkman_marker(path)) {
+        Some(KIND_CINDER)
+    } else {
+        Some(KIND_ANDROID)
+    }
+}
+
 pub fn infer_device_kind(internal_root: &str, sd_root: &str) -> String {
-    for root in [internal_root, sd_root] {
-        if root.is_empty() || root.starts_with("adb://") || root.starts_with("mtp://") {
-            continue;
-        }
-        if has_walkman_marker(root) {
-            return KIND_CINDER.into();
-        }
-        if get_volume_label(root).eq_ignore_ascii_case("WALKMAN") {
-            return KIND_CINDER.into();
-        }
-    }
-    if [internal_root, sd_root]
-        .iter()
-        .any(|r| r.starts_with("adb://") || r.starts_with("mtp://"))
-    {
-        return KIND_ANDROID.into();
-    }
-    for root in [internal_root, sd_root] {
-        if !root.is_empty() && has_music_folder(root) && !has_walkman_marker(root) {
-            return KIND_ANDROID.into();
-        }
-    }
-    KIND_CINDER.into()
+    evident_device_kind(internal_root, sd_root)
+        .unwrap_or(KIND_CINDER)
+        .to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -727,7 +753,7 @@ fn collect_macos() -> Vec<VolumeCandidate> {
 }
 
 fn is_walkman(c: &VolumeCandidate) -> bool {
-    c.label.eq_ignore_ascii_case("WALKMAN") || has_walkman_marker(&c.root)
+    has_walkman_marker(&c.root)
 }
 
 pub fn detect_walkman_roots() -> (String, String) {
@@ -924,7 +950,9 @@ pub fn bind_live_device(
         } else {
             profile.sd_drive.clear();
         }
-        if created && (inferred_kind == KIND_CINDER || inferred_kind == KIND_ANDROID) {
+        if let Some(kind) = evident_device_kind(internal_drive, sd_drive) {
+            profile.device_kind = kind.to_string();
+        } else if created {
             profile.device_kind = inferred_kind.to_string();
         }
         before
@@ -1128,6 +1156,65 @@ pub fn human_eta_display(secs: f64) -> String {
         (secs / 15.0).round() * 15.0
     };
     human_eta(quantized)
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn mounted_music_without_cinder_files_is_android() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("Music")).unwrap();
+        let path = root.join("Music").to_string_lossy().into_owned();
+        assert_eq!(evident_device_kind(&path, ""), Some(KIND_ANDROID));
+        assert_eq!(infer_device_kind(&path, ""), KIND_ANDROID);
+    }
+
+    #[test]
+    fn unmounted_path_is_not_classified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing").join("MUSIC");
+        let path = missing.to_string_lossy().into_owned();
+        assert_eq!(evident_device_kind(&path, ""), None);
+    }
+
+    #[test]
+    fn cinder_markers_beside_music_override_android_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("MUSIC")).unwrap();
+        fs::write(root.join("cinder_loved.tsv"), "x").unwrap();
+        let music = root.join("MUSIC").to_string_lossy().into_owned();
+        assert_eq!(infer_device_kind(&music, ""), KIND_CINDER);
+        assert_eq!(evident_device_kind(&music, ""), Some(KIND_CINDER));
+
+        fs::write(root.join(".sony-sync-serial"), "silver").unwrap();
+        let mut settings = SyncSettings::default();
+        settings.devices.insert(
+            "silver".into(),
+            DeviceProfile {
+                name: "Silver Walkman".into(),
+                device_kind: KIND_ANDROID.into(),
+                internal_serial: "silver".into(),
+                ..DeviceProfile::default()
+            },
+        );
+        settings.active_device = "silver".into();
+        bind_live_device(&mut settings, &music, "", KIND_CINDER);
+        assert_eq!(settings.device_kind(), KIND_CINDER);
+    }
+
+    #[test]
+    fn kind_ignores_volume_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("MUSIC")).unwrap();
+        fs::write(root.join("default-capability.xml"), "<c/>").unwrap();
+        let music = root.join("MUSIC").to_string_lossy().into_owned();
+        assert_eq!(evident_device_kind(&music, ""), Some(KIND_CINDER));
+    }
 }
 
 #[cfg(test)]

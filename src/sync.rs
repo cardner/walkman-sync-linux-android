@@ -141,6 +141,16 @@ impl AppConfig {
         if paths.0.is_empty() && paths.1.is_empty() {
             paths = storage::detect_android_mounts();
         }
+        if android
+            && walkman::infer_device_kind(&paths.0, &paths.1) == walkman::KIND_CINDER
+            && !storage::is_remote(&paths.0)
+            && !storage::is_remote(&paths.1)
+        {
+            let cinder_paths = walkman::detect_walkman_paths(false);
+            if !cinder_paths.0.is_empty() || !cinder_paths.1.is_empty() {
+                paths = cinder_paths;
+            }
+        }
         if paths.0.is_empty() && paths.1.is_empty() {
             walkman::apply_listen_credentials(&self.internal_drive(), &self.sd_drive());
             return false;

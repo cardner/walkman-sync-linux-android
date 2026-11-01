@@ -1292,10 +1292,6 @@ mod tests {
             "mtp://WALKMAN/Internal shared storage/Music"
         );
         assert_eq!(sd, "mtp://WALKMAN/SlvrWalkman/Music");
-        assert_eq!(
-            walkman::infer_device_kind(&internal, &sd),
-            walkman::KIND_ANDROID
-        );
         assert_eq!(serial(&internal), "mtp-WALKMAN");
     }
 

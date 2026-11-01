@@ -137,10 +137,42 @@ fn as_float(value: &Value) -> Option<f64> {
 
 pub fn playlists_from_json(body: &str) -> Result<Vec<Playlist>, String> {
     let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
-    let obj = value.as_object().ok_or("audiomuse playlists: expected an object")?;
+    let obj = value
+        .as_object()
+        .ok_or("audiomuse playlists: expected an object")?;
     let mut out = Vec::new();
     let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    for (name, tracks) in obj {
+    for playlists in playlist_groups(obj) {
+        append_playlists(playlists, &mut out, &mut seen);
+    }
+    Ok(out)
+}
+
+/// Current AudioMuse groups mixes per server. Older servers return one object of
+/// mix name → track array. The `servers` array itself is not a playlist.
+fn playlist_groups(
+    obj: &serde_json::Map<String, Value>,
+) -> Vec<&serde_json::Map<String, Value>> {
+    let Some(servers) = obj.get("servers").and_then(|v| v.as_array()) else {
+        return vec![obj];
+    };
+    let groups: Vec<_> = servers
+        .iter()
+        .filter_map(|server| server.get("playlists").and_then(|v| v.as_object()))
+        .collect();
+    if groups.is_empty() {
+        vec![obj]
+    } else {
+        groups
+    }
+}
+
+fn append_playlists(
+    playlists: &serde_json::Map<String, Value>,
+    out: &mut Vec<Playlist>,
+    seen: &mut std::collections::HashMap<String, u32>,
+) {
+    for (name, tracks) in playlists {
         let Some(arr) = tracks.as_array() else { continue };
         let (kind, display) = classify(name);
         let mut list_id = format!("{AUDIOMUSE_ID_PREFIX}{}", clean(name));
@@ -169,6 +201,9 @@ pub fn playlists_from_json(body: &str) -> Result<Vec<Playlist>, String> {
                 break;
             }
         }
+        if parsed.is_empty() {
+            continue;
+        }
         out.push(Playlist {
             id: list_id,
             kind,
@@ -176,7 +211,6 @@ pub fn playlists_from_json(body: &str) -> Result<Vec<Playlist>, String> {
             tracks: parsed,
         });
     }
-    Ok(out)
 }
 
 fn mood_labels(raw: &str) -> String {
@@ -300,9 +334,13 @@ fn fetch(url: &str, token: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+pub fn android_blocks_audiomuse(config: &AppConfig) -> bool {
+    config.is_android()
+}
+
 pub fn prepare(config: &AppConfig, progress: &mut dyn FnMut(&str)) -> PullResult {
     let mut result = PullResult::default();
-    if config.is_android() {
+    if android_blocks_audiomuse(config) {
         result.skipped = "AudioMuse skipped (android-walkman)".into();
         return result;
     }
@@ -405,4 +443,68 @@ pub fn preview_rows(result: &PullResult) -> Vec<String> {
     }
     rows.push(format!("{} mix(es), {} score(s)", result.mixes.len(), result.scores.len()));
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_servers_become_separate_mixes() {
+        let body = r#"{
+          "multi_server": true,
+          "servers": [{
+            "server_name": "Default",
+            "is_default": true,
+            "playlists": {
+              "Late_automatic": [
+                {"item_id": "1", "title": "Night", "author": "Queen", "album": "Opera"}
+              ],
+              "Bus_instant": [
+                {"item_id": "2", "title": "One", "artist": "U2"}
+              ],
+              "Sonic Fingerprint by AudioMuse-AI": [
+                {"item_id": "3", "title": "Stay", "author": "Rihanna", "album": "Talk"}
+              ]
+            }
+          }]
+        }"#;
+        let lists = playlists_from_json(body).unwrap();
+        assert_eq!(lists.len(), 3, "{lists:?}");
+        assert!(lists.iter().all(|item| item.id.starts_with("am:")));
+        assert_eq!(
+            lists.iter().find(|item| item.kind == "automatic").unwrap().name,
+            "Late"
+        );
+        assert_eq!(
+            lists.iter().find(|item| item.kind == "instant").unwrap().name,
+            "Bus"
+        );
+        let rendered = render_playlists(&lists);
+        let playlist_rows = rendered
+            .lines()
+            .filter(|line| line.starts_with("playlist\t"))
+            .count();
+        assert_eq!(playlist_rows, 3);
+        assert!(rendered.contains("track\tam:Late_automatic\tQueen\tNight\tOpera"));
+        assert!(rendered.contains("track\tam:Bus_instant\tU2\tOne\t"));
+    }
+
+    #[test]
+    fn flat_playlist_map_still_parses() {
+        let body = r#"{
+          "Late_automatic": [
+            {"title": "Night", "author": "Queen", "album": "Opera"},
+            {"title": "", "author": "Queen"}
+          ],
+          "Sonic Fingerprint by AudioMuse-AI": [
+            {"title": "One", "artist": "U2"}
+          ]
+        }"#;
+        let lists = playlists_from_json(body).unwrap();
+        assert_eq!(lists.len(), 2);
+        let late = lists.iter().find(|item| item.name == "Late").unwrap();
+        assert_eq!(late.tracks.len(), 1);
+        assert_eq!(late.id, "am:Late_automatic");
+    }
 }

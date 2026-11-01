@@ -466,6 +466,10 @@ impl App {
     }
 
     fn dispatch(&mut self, action: &str) {
+        if !action_enabled(&self.config, action) {
+            self.toast = "not available on this Walkman".into();
+            return;
+        }
         match action {
             "quit" => self.should_quit = true,
             "sync" => self.do_sync(),
@@ -689,7 +693,7 @@ impl App {
 
     fn do_audiomuse(&mut self) {
         self.config.pull_listen_credentials();
-        if self.config.is_android() {
+        if audiomuse::android_blocks_audiomuse(&self.config) {
             self.toast = "AudioMuse skipped (android-walkman)".into();
             return;
         }
@@ -1939,15 +1943,9 @@ fn draw_dashboard(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = ACTIONS
         .iter()
         .enumerate()
-        .map(|(i, (k, label, _))| {
-            let style = if i == app.menu {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(AMBER)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+        .map(|(i, (k, label, action))| {
+            let enabled = action_enabled(&app.config, action);
+            let style = menu_item_style(i == app.menu, enabled);
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {k}  {label}"), style),
             ]))
@@ -2664,6 +2662,34 @@ fn draw_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn cinder_only(action: &str) -> bool {
+    matches!(action, "audiomuse" | "scrobbles")
+}
+
+fn action_enabled(config: &AppConfig, action: &str) -> bool {
+    !(cinder_only(action) && config.is_android())
+}
+
+fn menu_item_style(selected: bool, enabled: bool) -> Style {
+    if !enabled {
+        let mut style = Style::default()
+            .fg(Color::Rgb(88, 88, 88))
+            .add_modifier(Modifier::DIM);
+        if selected {
+            style = style.bg(Color::Rgb(36, 36, 36));
+        }
+        return style;
+    }
+    if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(AMBER)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    }
+}
+
 fn cap_text_rows(mut rows: Vec<String>) -> Vec<String> {
     const CAP: usize = 500;
     if rows.is_empty() {
@@ -2723,9 +2749,9 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod dest_bar_tests {
     use super::{
-        backspace_at, cap_text_rows, commit_eta, dest_bar_segments, displayed_eta_secs, eta_label,
-        insert_at, live_dest_used, meter_label, prompt_line, prompt_shown, sample_rate,
-        should_probe_dest, spinner_frame, Progress, ProgressUnit,
+        backspace_at, cap_text_rows, cinder_only, commit_eta, dest_bar_segments, displayed_eta_secs,
+        eta_label, insert_at, live_dest_used, menu_item_style, meter_label, prompt_line,
+        prompt_shown, sample_rate, should_probe_dest, spinner_frame, Progress, ProgressUnit,
     };
     use ratatui::layout::Rect;
     use std::time::{Duration, Instant};
@@ -2754,6 +2780,18 @@ mod dest_bar_tests {
             ..Progress::default()
         };
         assert_eq!(live_dest_used(&copying), 70);
+    }
+
+    #[test]
+    fn android_menu_dims_cinder_only_actions() {
+        assert!(cinder_only("audiomuse"));
+        assert!(cinder_only("scrobbles"));
+        assert!(!cinder_only("sync"));
+        assert!(!cinder_only("likes"));
+        let dim = menu_item_style(false, false);
+        assert!(dim.add_modifier.contains(ratatui::style::Modifier::DIM));
+        let live = menu_item_style(true, true);
+        assert!(live.add_modifier.contains(ratatui::style::Modifier::BOLD));
     }
 
     #[test]
