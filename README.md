@@ -203,6 +203,11 @@ reach Channels.
  ↑↓ move  ⏎ choose  r refresh plan  q quit
 ```
 
+### Transfer in progress 
+
+<img width="1111" height="622" alt="image" src="https://github.com/user-attachments/assets/b66b0d37-4ef8-468d-9bef-222853344d28" />
+
+
 Hotkeys: `1` sync, `2` plan, `r` refresh plan (walks dest), `5` likes, `i`/`w` index, `s` settings, `l` Last.fm, `q` quit.
 
 ## Tests
