@@ -203,12 +203,22 @@ reach Channels.
  ↑↓ move  ⏎ choose  r refresh plan  q quit
 ```
 
+Hotkeys: `1` sync, `2` plan, `r` refresh plan (walks dest), `5` likes, `i`/`w` index, `s` settings, `l` Last.fm, `q` quit.
+
+### Main Menu
+
+<img width="1113" height="625" alt="image" src="https://github.com/user-attachments/assets/e2e680d5-c4fb-4025-8115-660ae9c05965" />
+
+
 ### Transfer in progress 
 
 <img width="1111" height="622" alt="image" src="https://github.com/user-attachments/assets/b66b0d37-4ef8-468d-9bef-222853344d28" />
 
+### Settings
 
-Hotkeys: `1` sync, `2` plan, `r` refresh plan (walks dest), `5` likes, `i`/`w` index, `s` settings, `l` Last.fm, `q` quit.
+<img width="1110" height="624" alt="image" src="https://github.com/user-attachments/assets/52fae09d-e5e7-444d-9a30-51e38e211ebf" />
+
+
 
 ## Tests
 
